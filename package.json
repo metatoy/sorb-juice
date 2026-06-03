@@ -1,0 +1,46 @@
+{
+  "name": "@metatoy/sorb-juice",
+  "version": "1.2.0",
+  "description": "Local token bridge server and dev tooling for Sorb — the live conduit carrying tokens across (CLI command: sorb)",
+  "license": "MIT",
+  "keywords": [
+    "sorb",
+    "design-tokens",
+    "figma",
+    "cli",
+    "tokens"
+  ],
+  "homepage": "https://github.com/metatoy/sorb-juice#readme",
+  "bugs": "https://github.com/metatoy/sorb-juice/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/metatoy/sorb-juice.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "bin": {
+    "sorb": "dist/cli.js"
+  },
+  "main": "dist/index.js",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "node build.mjs",
+    "dev": "node build.mjs --watch",
+    "prepublishOnly": "node build.mjs"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.12.0",
+    "@metatoy/sorb-core": "^0.1.0",
+    "chokidar": "^3.6.0",
+    "commander": "^12.0.0",
+    "hono": "^4.4.0",
+    "nanoid": "^5.0.0",
+    "picocolors": "^1.0.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.21.0"
+  }
+}
