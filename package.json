@@ -34,7 +34,6 @@
   },
   "dependencies": {
     "@hono/node-server": "^1.12.0",
-    "@sorb/core": "^0.1.0",
     "chokidar": "^3.6.0",
     "commander": "^12.0.0",
     "hono": "^4.4.0",
