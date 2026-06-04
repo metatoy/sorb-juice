@@ -1,6 +1,8 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { nanoid } from 'nanoid'
+import { resolveApiKey, SCOPE } from './auth.js'
+import { getEntitlements, effectiveEntitlements, FREE } from './entitlements.js'
 
 /**
  * Build the Hono bridge app. All preview/verify state lives in the injected
@@ -8,16 +10,32 @@ import { nanoid } from 'nanoid'
  * prune timers (pruning now lives in the store). Id generation (nanoid(8))
  * stays here; the store never mints ids.
  *
+ * ## Two modes — gated entirely on `config.databaseUrl`
+ *
+ * **LOCAL mode** (`config.databaseUrl` UNSET): behaves EXACTLY as the free local
+ * bridge always has — no auth, open CORS ('*' or CORS_ORIGINS), in-memory store,
+ * all routes open and un-tenant-scoped. Zero new behavior is registered.
+ *
+ * **HOSTED mode** (`config.databaseUrl` SET): the bridge reads sorb-cloud's
+ * shared Postgres for auth + entitlements:
+ *   - scoped CORS sourced from the project's `allowed_origins`,
+ *   - a Bearer API key is required on every route except `/health` + `/ready`,
+ *   - publishable keys are read-only (GET /preview/:id only; writes → 403),
+ *   - entitlements are enforced (maxActivePreviews → 402, preview TTL,
+ *     sharing-gated actions → 402), with past_due/canceled orgs degraded to Free.
+ *
  * @param {Object} options
  * @param {import('./types').Store} options.store
  *   Required. A Store instance from src/store/index.js. All preview + verify
  *   handlers delegate to it (awaited).
  * @param {import('./types').Config} options.config
  *   Required. Config from src/config.js. Supplies `namespace` (surfaced in
- *   /health), `corsOrigins`, and the TTL/prune windows the store honors.
+ *   /health), `corsOrigins`, `databaseUrl` (the hosted-mode switch) and the
+ *   TTL/prune windows the store honors.
  * @param {import('./types').DbHandle | null} [options.db]
  *   Optional Postgres handle (or null in local mode). /ready pings it only when
- *   it is non-null (a configured backend).
+ *   it is non-null. In hosted mode it is the source for auth + entitlements +
+ *   the per-project active-preview count, and MUST be non-null.
  * @param {() => import('./types').TokenSet} [options.getLatestTokens]
  *   Latest committed tokens for /tokens/latest. Defaults to () => ({}).
  * @param {() => (Array<{id:string,cssVar:string,value:string,tier:string,type:string}> | null)} [options.getResolvedTokens]
@@ -43,16 +61,187 @@ export const createServer = ({
   const corsOrigin =
     config.corsOrigins && config.corsOrigins !== '*' ? config.corsOrigins : '*'
 
+  // The ONE switch. Everything new lives behind `hosted`; when it is false the
+  // server is byte-for-byte the free local bridge it has always been.
+  const hosted = Boolean(config.databaseUrl)
+
+  // Where to send a user who hits a paid gate (402). Relative '/billing' by
+  // default; overridable for the hosted control-plane host.
+  const upgradeUrl = process.env.SORB_UPGRADE_URL || '/billing'
+
+  // Preview TTL for persistent (paid) previews. null = no expiry; otherwise the
+  // configured (default 24h) window for Free orgs.
+  const previewTtlMs = config.previewTtlMs || 86_400_000
+
   const app = new Hono()
 
-  // Allow requests from the configured origins — the plugin UI and the React
-  // app are on different origins from the local server. Local default is '*'.
-  app.use('*', cors({ origin: corsOrigin }))
+  // ───────────────────────────────────────────────────────────────────────────
+  // HOSTED middleware (registered ONLY when a database is configured)
+  // ───────────────────────────────────────────────────────────────────────────
+  if (hosted) {
+    // 1) Auth — resolve the Bearer key on every route except infra probes and
+    //    CORS preflight. MUST run BEFORE the CORS middleware: Hono's `cors`
+    //    evaluates its `origin` callback at the TOP of its handler (before
+    //    `next()`), so the authed context it scopes against has to already be on
+    //    the request. Registering auth first guarantees `c.get('auth')` is
+    //    populated by the time CORS decides the Access-Control-Allow-Origin
+    //    header for real (keyed) requests. Preflight (OPTIONS) carries no
+    //    Authorization header, so we skip auth for it and let CORS answer it.
+    app.use('*', async (c, next) => {
+      const path = c.req.path
+      if (path === '/health' || path === '/ready') return next()
+      // Preflight: no body, no key. Let the CORS middleware (registered next)
+      // answer it; never 401 a preflight.
+      if (c.req.method === 'OPTIONS') return next()
+
+      let ctx
+      try {
+        ctx = await resolveApiKey(db, c.req.header('Authorization'))
+      } catch (e) {
+        // DB outage during auth lookup — fail CLOSED, never fall through to
+        // open/local behavior.
+        return c.json({ error: 'Service unavailable', code: 'db_unavailable' }, 503)
+      }
+      if (!ctx) {
+        return c.json({ error: 'Unauthorized', code: 'unauthorized' }, 401)
+      }
+      c.set('auth', ctx)
+
+      // Resolve + degrade entitlements once per request, behind the same DB.
+      let ent
+      try {
+        ent = effectiveEntitlements(await getEntitlements(db, ctx.orgId))
+      } catch (e) {
+        return c.json({ error: 'Service unavailable', code: 'db_unavailable' }, 503)
+      }
+      c.set('ent', ent)
+
+      return next()
+    })
+
+    // 2) Scoped CORS — defense-in-depth on top of auth + tenant scoping.
+    //    NEVER '*' in hosted mode. Preflight (OPTIONS) carries no Authorization
+    //    header so it cannot be project-scoped; we echo the Origin permissively
+    //    for preflight (it reveals nothing — the real request is still auth +
+    //    tenant gated). For real (keyed) requests auth has already run, so we
+    //    echo the Origin only when it is a member of the authed project's
+    //    allowed_origins.
+    app.use(
+      '*',
+      cors({
+        origin: (origin, c) => {
+          if (!origin) return origin
+          // Preflight: no body, no key — echo so the browser proceeds to the
+          // real (authoritative) request.
+          if (c.req.method === 'OPTIONS') return origin
+          const ctx = c.get('auth')
+          if (ctx && Array.isArray(ctx.allowedOrigins) && ctx.allowedOrigins.includes(origin)) {
+            return origin
+          }
+          // Deny: returning undefined omits the ACAO header. Empty
+          // allowed_origins ⇒ deny all cross-origin (never '*').
+          return undefined
+        },
+      }),
+    )
+  } else {
+    // LOCAL mode — today's open CORS, unchanged.
+    app.use('*', cors({ origin: corsOrigin }))
+  }
+
+  // Scope guard: WRITE ops require a 'secret' key. Returns a Response (the 403)
+  // when the key is read-only, or null when the caller may proceed. In local
+  // mode there is no auth context, so this is a no-op.
+  const requireWrite = (c) => {
+    if (!hosted) return null
+    const ctx = c.get('auth')
+    if (ctx.scope !== SCOPE.WRITE) {
+      return c.json({ error: 'Publishable keys are read-only', code: 'read_only' }, 403)
+    }
+    return null
+  }
+
+  // Count the authed project's currently-active previews from the DB previews
+  // table (project-scoped + TTL-aware). Owned by juice (001_core.sql).
+  const activePreviewCount = async (projectId) => {
+    const res = await db.query(
+      'SELECT count(*)::int AS n FROM previews WHERE project_id = $1 AND (expires_at IS NULL OR expires_at > now())',
+      [projectId],
+    )
+    const row = res && res.rows && res.rows[0]
+    return row ? Number(row.n) || 0 : 0
+  }
+
+  // Sharing gate (frozen for the future share route). Returns the 402 Response
+  // when sharing is locked, else null.
+  const requireSharing = (c) => {
+    const ent = c.get('ent')
+    if (!ent || ent.previewSharing !== true) {
+      return c.json({ error: 'Preview sharing is not available on your plan', code: 'sharing_locked', upgradeUrl }, 402)
+    }
+    return null
+  }
 
   // ─── POST /preview ────────────────────────────────────────────────────────
   // Figma plugin POSTs a proposed token set here.
   // Returns a short preview ID the React app can use via ?preview=<id>
   app.post('/preview', async (c) => {
+    if (hosted) {
+      const denied = requireWrite(c)
+      if (denied) return denied
+
+      const ctx = c.get('auth')
+      const ent = c.get('ent')
+
+      // Sharing-gated when explicitly requested via ?share=1 (frozen contract).
+      if (c.req.query('share') === '1') {
+        const locked = requireSharing(c)
+        if (locked) return locked
+      }
+
+      // Active-preview cap. -1 = unlimited (Free gate is TTL+sharing, not count).
+      if (ent.maxActivePreviews !== -1) {
+        let active
+        try {
+          active = await activePreviewCount(ctx.projectId)
+        } catch (e) {
+          return c.json({ error: 'Service unavailable', code: 'db_unavailable' }, 503)
+        }
+        if (active >= ent.maxActivePreviews) {
+          return c.json(
+            {
+              error: `Active preview limit reached (${ent.maxActivePreviews}). Upgrade for more concurrent previews.`,
+              code: 'preview_limit',
+              upgradeUrl,
+            },
+            402,
+          )
+        }
+      }
+
+      const tokens = await c.req.json()
+      const id = nanoid(8)
+      // Persistent (paid) ⇒ no expiry; otherwise 24h TTL.
+      const ttlMs = ent.previewPersistence ? null : previewTtlMs
+      await store.putPreview(id, tokens, ttlMs)
+
+      // Bookkeeping row for the per-project count + TTL (juice owns previews).
+      const expiresAt = ttlMs == null ? null : new Date(Date.now() + ttlMs)
+      try {
+        await db.query(
+          'INSERT INTO previews (id, project_id, expires_at) VALUES ($1, $2, $3)',
+          [id, ctx.projectId, expiresAt],
+        )
+      } catch (e) {
+        // Best-effort bookkeeping: the preview is already in the store. A failed
+        // insert only affects future counting; do not fail the request.
+      }
+
+      const url = `?preview=${id}`
+      return c.json({ id, url })
+    }
+
+    // LOCAL mode — unchanged.
     const tokens = await c.req.json()
     const id = nanoid(8)
     await store.putPreview(id, tokens)
@@ -61,19 +250,57 @@ export const createServer = ({
   })
 
   // ─── GET /preview/:id ─────────────────────────────────────────────────────
-  // React app polls this while a preview is active.
+  // React app polls this while a preview is active. Allowed for BOTH read
+  // (publishable) and write (secret) scope in hosted mode.
   app.get('/preview/:id', async (c) => {
-    const entry = await store.getPreview(c.req.param('id'))
+    const id = c.req.param('id')
+    const entry = await store.getPreview(id)
     if (!entry) {
       return c.json({ error: 'Preview not found or expired' }, 404)
+    }
+    if (hosted) {
+      // Tenant isolation: never reveal a cross-tenant preview's existence.
+      const ctx = c.get('auth')
+      let owned = false
+      try {
+        const res = await db.query(
+          'SELECT 1 FROM previews WHERE id = $1 AND project_id = $2 LIMIT 1',
+          [id, ctx.projectId],
+        )
+        owned = Boolean(res && res.rows && res.rows.length)
+      } catch (e) {
+        return c.json({ error: 'Service unavailable', code: 'db_unavailable' }, 503)
+      }
+      if (!owned) {
+        return c.json({ error: 'Preview not found or expired' }, 404)
+      }
     }
     return c.json(entry.tokens)
   })
 
   // ─── PUT /preview/:id ─────────────────────────────────────────────────────
-  // Plugin updates an existing preview in-place (live edit mode).
+  // Plugin updates an existing preview in-place (live edit mode). WRITE op.
   app.put('/preview/:id', async (c) => {
     const id = c.req.param('id')
+    if (hosted) {
+      const denied = requireWrite(c)
+      if (denied) return denied
+      // Tenant scope: a cross-tenant id is "not found".
+      const ctx = c.get('auth')
+      let owned = false
+      try {
+        const res = await db.query(
+          'SELECT 1 FROM previews WHERE id = $1 AND project_id = $2 LIMIT 1',
+          [id, ctx.projectId],
+        )
+        owned = Boolean(res && res.rows && res.rows.length)
+      } catch (e) {
+        return c.json({ error: 'Service unavailable', code: 'db_unavailable' }, 503)
+      }
+      if (!owned) {
+        return c.json({ error: 'Preview not found' }, 404)
+      }
+    }
     const tokens = await c.req.json()
     const updated = await store.updatePreview(id, tokens)
     if (!updated) {
@@ -83,16 +310,50 @@ export const createServer = ({
   })
 
   // ─── DELETE /preview/:id ──────────────────────────────────────────────────
-  // Plugin clears a preview when designer exits without committing.
+  // Plugin clears a preview when designer exits without committing. WRITE op.
   app.delete('/preview/:id', async (c) => {
-    await store.deletePreview(c.req.param('id'))
+    const id = c.req.param('id')
+    if (hosted) {
+      const denied = requireWrite(c)
+      if (denied) return denied
+      // Tenant scope: only delete (and report deleted) when it belongs to the
+      // tenant. A cross-tenant id is treated as already-absent.
+      const ctx = c.get('auth')
+      let owned = false
+      try {
+        const res = await db.query(
+          'SELECT 1 FROM previews WHERE id = $1 AND project_id = $2 LIMIT 1',
+          [id, ctx.projectId],
+        )
+        owned = Boolean(res && res.rows && res.rows.length)
+      } catch (e) {
+        return c.json({ error: 'Service unavailable', code: 'db_unavailable' }, 503)
+      }
+      if (!owned) {
+        return c.json({ error: 'Preview not found' }, 404)
+      }
+      await store.deletePreview(id)
+      try {
+        await db.query('DELETE FROM previews WHERE id = $1 AND project_id = $2', [id, ctx.projectId])
+      } catch (e) {
+        // Best-effort: the store entry is gone; a stale bookkeeping row only
+        // affects future counting and will TTL out.
+      }
+      return c.json({ deleted: true })
+    }
+    await store.deletePreview(id)
     return c.json({ deleted: true })
   })
 
   // ─── POST /verify ─────────────────────────────────────────────────────────
   // Plugin posts the post-layout geometry of an inserted component so the
   // canvas can be reconciled against the captured artifact. Returns a short id.
+  // WRITE op.
   app.post('/verify', async (c) => {
+    if (hosted) {
+      const denied = requireWrite(c)
+      if (denied) return denied
+    }
     const { storyId, bbox, meta } = await c.req.json()
     const id = nanoid(8)
     await store.putVerification(id, { storyId, bbox, meta })
@@ -168,6 +429,7 @@ export const createServer = ({
   })
 
   // ─── GET /health ──────────────────────────────────────────────────────────
+  // Infra probe — open in ALL modes (no auth, no tenant scope).
   app.get('/health', async (c) => {
     return c.json({
       ok: true,
@@ -179,9 +441,9 @@ export const createServer = ({
 
   // ─── GET /ready ───────────────────────────────────────────────────────────
   // Readiness probe: 200 only when every *configured* backend is reachable.
-  // The in-memory store always pings true; a null db (local mode) is "not
-  // configured" and skipped. Returns 503 with { ok:false, checks } when any
-  // configured backend is unreachable.
+  // Open in ALL modes (no auth). The in-memory store always pings true; a null
+  // db (local mode) is "not configured" and skipped. Returns 503 with
+  // { ok:false, checks } when any configured backend is unreachable.
   app.get('/ready', async (c) => {
     /** @type {Record<string, boolean>} */
     const checks = {}
