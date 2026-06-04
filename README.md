@@ -1,22 +1,22 @@
-# @metatoy/sorb-juice
+# @sorb/juice
 
 Local token bridge server and dev tooling for
 [Sorb](https://github.com/nhunsaker/sorb). A dev dependency only —
 it never touches production.
 
 ```bash
-npm install -D @metatoy/sorb-juice
+npm install -D @sorb/juice
 ```
 
 This installs the `sorb` binary into your project. To run it once
 without installing first, use the full package name with npx:
 
 ```bash
-npx @metatoy/sorb-juice init
+npx @sorb/juice init
 ```
 
 > `sorb` is the binary, not the package name. `npx sorb` only works
-> after `@metatoy/sorb-juice` is installed locally; otherwise npx fails
+> after `@sorb/juice` is installed locally; otherwise npx fails
 > with `could not determine executable to run`.
 
 ## Commands
