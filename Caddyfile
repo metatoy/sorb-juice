@@ -1,0 +1,35 @@
+# ---------------------------------------------------------------------------
+# Caddy reverse proxy for the @sorb/juice bridge.
+#
+# Terminates TLS and fronts the `juice` service, mirroring the production
+# Caddy/Coolify TLS edge. For local-parity (docker-compose) the default site
+# address uses Caddy's automatic local CA over HTTPS.
+#
+# In production set SORB_DOMAIN to your real hostname; Caddy then provisions a
+# trusted ACME certificate automatically.
+# ---------------------------------------------------------------------------
+
+{
+	# Quiet admin endpoint to the loopback only.
+	admin off
+}
+
+# Local parity: https://localhost with Caddy's internal CA.
+# Override with an env-provided domain in production:
+#   SORB_DOMAIN=bridge.sorb.com  ->  set the site address below accordingly.
+{$SORB_DOMAIN:localhost} {
+	encode gzip zstd
+
+	# Forward everything to the bridge server on its internal port.
+	reverse_proxy juice:7777 {
+		# Pass through original host/scheme so the app can build correct URLs.
+		header_up Host {host}
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+
+		# Lightweight upstream health gate using the bridge's /ready probe.
+		health_uri /ready
+		health_interval 30s
+		health_timeout 5s
+	}
+}

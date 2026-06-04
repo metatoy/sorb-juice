@@ -1,4 +1,8 @@
 export { createServer } from './server'
+export { createStore } from './store/index'
+export { createMemoryStore } from './store/memory'
+export { loadConfig } from './config'
+export { createDb } from './db/index'
 export { watchTokenFile } from './watch'
 export { runStyleDictionary } from './transform'
 export { openTokenPR } from './github'

@@ -1,0 +1,33 @@
+# Build context exclusions for the @sorb/juice image.
+# node_modules + dist are produced fresh inside the builder stage.
+
+node_modules
+dist
+
+# Local Sorb runtime state / generated outputs (never built).
+.sorb
+
+# VCS + CI metadata.
+.git
+.gitignore
+.github
+
+# Tests are not needed in the image.
+*.test.js
+**/*.test.js
+
+# Local env / secrets — never bake into the image. .env.example is allowed.
+.env
+.env.*
+!.env.example
+
+# Editor / OS cruft.
+.DS_Store
+*.log
+npm-debug.log*
+
+# Container files themselves don't belong in the build context.
+Dockerfile
+.dockerignore
+docker-compose.yml
+Caddyfile
