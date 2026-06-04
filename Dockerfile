@@ -18,7 +18,9 @@ FROM node:20-slim AS builder
 WORKDIR /app
 
 # Enable pnpm via corepack (Node 20 + pnpm per workspace rules).
-RUN corepack enable
+# Pin pnpm to a Node-20-compatible version — without this, corepack pulls the
+# latest pnpm (11.x), which requires Node 22+ (uses node:sqlite) and fails.
+RUN corepack enable && corepack prepare pnpm@9.15.0 --activate
 
 # Install dependencies first (cached layer). Copy only manifests so the deps
 # layer is reused when only source changes. The pnpm-lock.yaml lives at the
@@ -56,4 +58,4 @@ EXPOSE 7777
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||7777)+'/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
-CMD ["node", "dist/cli.js"]
+CMD ["node", "dist/cli.js", "serve"]
