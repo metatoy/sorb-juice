@@ -1,0 +1,94 @@
+# ---------------------------------------------------------------------------
+# @sorb/juice — local-parity hosted stack.
+#
+# Brings up the bridge (juice) wired to Redis + Postgres so the HOSTED code
+# path (dynamic redis.js / pg backends) is exercised end-to-end, fronted by
+# Caddy for TLS — mirroring the production Caddy/Coolify edge.
+#
+#   juice     — the bridge server (built from ./Dockerfile)
+#   postgres  — durable layer (DATABASE_URL)
+#   redis     — preview/verify store (REDIS_URL)
+#   caddy     — TLS reverse proxy in front of juice
+#
+# Free local users do NOT need this file — `sorb dev` runs the in-memory
+# bridge with zero new deps. This stack is for hosted-parity testing.
+# ---------------------------------------------------------------------------
+
+services:
+  juice:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      PORT: "7777"
+      SORB_NAMESPACE: "${SORB_NAMESPACE:-sorb-local}"
+      # PRESENCE of these switches the store/db onto the hosted backends.
+      REDIS_URL: "redis://redis:6379"
+      DATABASE_URL: "postgres://sorb:sorb@postgres:5432/sorb"
+      # Comma-separated allowed origins; config.js parses into an array.
+      CORS_ORIGINS: "${CORS_ORIGINS:-*}"
+      PREVIEW_TTL_MS: "${PREVIEW_TTL_MS:-86400000}"
+      PRUNE_INTERVAL_MS: "${PRUNE_INTERVAL_MS:-3600000}"
+      NODE_ENV: "${NODE_ENV:-production}"
+    expose:
+      - "7777"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # /ready returns 200 only when every configured backend is reachable.
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:7777/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: sorb
+      POSTGRES_PASSWORD: sorb
+      POSTGRES_DB: sorb
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sorb -d sorb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      juice:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  redis-data:
+  caddy-data:
+  caddy-config:

@@ -28,7 +28,7 @@ export const runStyleDictionary = (configPath) => {
     })
     console.log(pc.green('  ✓ Style Dictionary build complete'))
     return true
-  } catch {
+  } catch (e) {
     console.error(pc.red('  ✗ Style Dictionary build failed'))
     return false
   }

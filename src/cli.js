@@ -4,14 +4,19 @@ import { readFileSync, existsSync, writeFileSync } from 'fs'
 import { resolve } from 'path'
 import pc from 'picocolors'
 import { createServer } from './server'
-import { watchTokenFile, watchSources } from './watch'
+import { loadConfig } from './config'
+import { createStore } from './store/index'
+import { createDb } from './db/index'
+import { watchSources } from './watch'
 import { runStyleDictionary } from './transform'
 import { openTokenPR } from './github'
 
-// ─── config loader ────────────────────────────────────────────────────────────
+// ─── sorb.config.json loader ────────────────────────────────────────────────
+// The on-disk project config (namespace, token sources, port). Kept separate
+// from loadConfig() (env / 12-factor) which the store + db factories read.
 
 /** @returns {import('./types').SorbCliConfig} */
-const loadConfig = () => {
+const loadFileConfig = () => {
   const configPath = resolve(process.cwd(), 'sorb.config.json')
   if (!existsSync(configPath)) {
     console.error(pc.red('\n✗ No sorb.config.json found.\n'))
@@ -39,12 +44,23 @@ program
   .description('Start the local token bridge server')
   .option('-p, --port <port>', 'port to listen on', '7777')
   .action(async (opts) => {
-    const config = loadConfig()
-    const port = config.port ?? parseInt(opts.port)
+    const fileConfig = loadFileConfig()
+
+    // 12-factor env config, then merge the on-disk sorb.config.json on top so
+    // local mode keeps reading namespace/port from the file. With no hosted env
+    // vars set, redisUrl/databaseUrl stay undefined → in-memory store, no DB.
+    const envConfig = loadConfig()
+    const config = {
+      ...envConfig,
+      namespace: fileConfig.namespace ?? envConfig.namespace,
+      port: fileConfig.port ?? parseInt(opts.port) ?? envConfig.port,
+    }
+    const port = config.port
 
     // Token sources to watch (DTCG sets). Falls back to the legacy single
     // tokenPath for pre-taxonomy apps.
-    const sources = config.tokenSources || (config.tokenPath ? [config.tokenPath] : [])
+    const sources =
+      fileConfig.tokenSources || (fileConfig.tokenPath ? [fileConfig.tokenPath] : [])
 
     console.log(pc.bold('\nSorb'))
     console.log(pc.dim('  Namespace :') + ` ${config.namespace}`)
@@ -57,7 +73,7 @@ program
 
     const readJson = (p) => {
       if (!existsSync(p)) return null
-      try { return JSON.parse(readFileSync(p, 'utf-8')) } catch { return null }
+      try { return JSON.parse(readFileSync(p, 'utf-8')) } catch (e) { return null }
     }
     const readResolvedArray = () => {
       const data = readJson(resolvedPath)
@@ -69,7 +85,7 @@ program
     // Build tokens once up front, then on every source change, so the resolved
     // map the plugin/seed consume is always fresh.
     const buildTokens = () => {
-      if (config.styleDictionaryConfig) runStyleDictionary(config.styleDictionaryConfig)
+      if (fileConfig.styleDictionaryConfig) runStyleDictionary(fileConfig.styleDictionaryConfig)
     }
     buildTokens()
     const { stop } = watchSources(sources, buildTokens)
@@ -78,7 +94,7 @@ program
     // editor with. Prefer a legacy flat token file if present; otherwise derive
     // a flat { cssVarName: value } map from the SD-built resolved map, so the
     // DTCG taxonomy works without a hand-maintained flat file.
-    const legacyTokenAbs = config.tokenPath ? resolve(process.cwd(), config.tokenPath) : null
+    const legacyTokenAbs = fileConfig.tokenPath ? resolve(process.cwd(), fileConfig.tokenPath) : null
     const read = () => {
       if (legacyTokenAbs && existsSync(legacyTokenAbs)) {
         try { return JSON.parse(readFileSync(legacyTokenAbs, 'utf-8')) } catch (e) { return {} }
@@ -102,7 +118,22 @@ program
       return readJson(artPath)
     }
 
-    const app = createServer(config.namespace, read, readResolved, readIndex, readArtifact)
+    // Backend wiring. createStore picks in-memory (zero-dep default) unless
+    // config.redisUrl is set; createDb returns null unless config.databaseUrl
+    // is set. Local mode = both fall through to today's single-process behavior.
+    const store = await createStore(config)
+    const db = await createDb(config)
+    if (db && db.runMigrations) await db.runMigrations()
+
+    const app = createServer({
+      store,
+      config,
+      db,
+      getLatestTokens: read,
+      getResolvedTokens: readResolved,
+      getArtifactIndex: readIndex,
+      getArtifact: readArtifact,
+    })
 
     serve({ fetch: app.fetch, port }, () => {
       console.log(
@@ -120,8 +151,12 @@ program
       console.log(pc.dim('\n  Watching for token file changes...\n'))
     })
 
-    process.on('SIGINT', () => {
+    process.on('SIGINT', async () => {
       stop()
+      try { await store.close() } catch (e) { /* best-effort shutdown */ }
+      if (db) {
+        try { await db.close() } catch (e) { /* best-effort shutdown */ }
+      }
       console.log(pc.dim('\n  Stopped.\n'))
       process.exit(0)
     })
@@ -163,7 +198,7 @@ program
   .requiredOption('--pat <pat>', 'GitHub personal access token')
   .option('--message <message>', 'PR / commit title', 'Update design tokens')
   .action(async (opts) => {
-    const config = loadConfig()
+    const config = loadFileConfig()
     const content = readFileSync(
       resolve(process.cwd(), config.tokenPath),
       'utf-8',
