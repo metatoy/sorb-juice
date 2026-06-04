@@ -10,6 +10,7 @@ import { createDb } from './db/index'
 import { watchSources } from './watch'
 import { runStyleDictionary } from './transform'
 import { openTokenPR } from './github'
+import { initSentry, captureError, flushSentry } from './sentry'
 
 // ─── sorb.config.json loader ────────────────────────────────────────────────
 // The on-disk project config (namespace, token sources, port). Kept separate
@@ -172,6 +173,17 @@ program
   .command('serve')
   .description('Run the hosted bridge server (config from env; no sorb.config.json)')
   .action(async () => {
+    // Hosted entry ONLY. Init Sentry FIRST (before any backend wiring) so a
+    // startup error is captured. NO-OP when SENTRY_DSN is unset — the free
+    // local `dev` command never calls this, so it stays zero-Sentry regardless.
+    initSentry()
+    process.on('unhandledRejection', (reason) => {
+      captureError(reason, { at: 'unhandledRejection' })
+    })
+    process.on('uncaughtException', (err) => {
+      captureError(err, { at: 'uncaughtException' })
+    })
+
     const config = loadConfig()
     const port = config.port
 
@@ -204,6 +216,9 @@ program
       getResolvedTokens: () => null,
       getArtifactIndex: () => null,
       getArtifact: () => null,
+      // Route server-side DB-error / bookkeeping catches to Sentry. NO-OP when
+      // SENTRY_DSN is unset (captureError gates on the enabled flag).
+      onError: captureError,
     })
 
     serve({ fetch: app.fetch, port, hostname: '0.0.0.0' }, () => {
@@ -213,6 +228,8 @@ program
     const shutdown = async () => {
       try { await store.close() } catch (e) { /* best-effort shutdown */ }
       if (db) { try { await db.close() } catch (e) { /* best-effort shutdown */ } }
+      // Flush buffered Sentry events (NO-OP when Sentry is disabled).
+      try { await flushSentry(2000) } catch (e) { /* best-effort shutdown */ }
       process.exit(0)
     }
     process.on('SIGINT', shutdown)
