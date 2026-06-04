@@ -1,0 +1,45 @@
+name: Publish to npm
+
+# Fires when you publish a GitHub Release tagged vX.Y.Z (the tag's version
+# must match package.json). Builds (if the package has a build) and publishes
+# to npm under the @metatoy scope with provenance.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write # required for npm provenance (public repos)
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      # Guard: the release tag (vX.Y.Z) must match package.json's version,
+      # so you can never publish a version you forgot to bump.
+      - name: Verify tag matches package.json version
+        run: |
+          PKG="$(node -p "require('./package.json').version")"
+          TAG="${GITHUB_REF_NAME#v}"
+          echo "package.json=$PKG  tag=$TAG"
+          if [ "$PKG" != "$TAG" ]; then
+            echo "::error::Release tag v$TAG does not match package.json $PKG"
+            exit 1
+          fi
+
+      - name: Install
+        run: npm install
+
+      # prepublishOnly builds dist/ for packages that have a build step;
+      # src-only packages just publish their files.
+      - name: Publish
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
