@@ -121,20 +121,48 @@ describe('verify 404 before any report', () => {
 const PROJECT_A = '11111111-1111-1111-1111-111111111111'
 const ORG_A = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
 
+// ── Project / org B: a SECOND, fully distinct tenant. Cross-tenant isolation
+//    asserts that a key bound to A can never read/write/delete B's previews and
+//    vice versa, and that B's usage never affects A's gates (and vice versa).
+const PROJECT_B = '22222222-2222-2222-2222-222222222222'
+const ORG_B = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+
 const SECRET_KEY = 'sk_secret_test'
 const PUBLISHABLE_KEY = 'pk_publishable_test'
 const SECRET_HASH = hashKey(SECRET_KEY)
 const PUBLISHABLE_HASH = hashKey(PUBLISHABLE_KEY)
 
+// Project-B keys (secret + publishable), distinct raw values ⇒ distinct hashes.
+const SECRET_KEY_B = 'sk_secret_test_b'
+const PUBLISHABLE_KEY_B = 'pk_publishable_test_b'
+const SECRET_HASH_B = hashKey(SECRET_KEY_B)
+const PUBLISHABLE_HASH_B = hashKey(PUBLISHABLE_KEY_B)
+
 /**
  * Build a FAKE db whose query() routes on the SQL text. Overrides let each test
- * tune the entitlements row + active preview count.
+ * tune the entitlements row + active preview count, and force any tenant DB path
+ * to throw so the server's fail-closed (503) behavior can be asserted.
+ *
+ * Ownership is recorded per-project as a Map<id, projectId> (NOT a Set), so the
+ * `SELECT 1 FROM previews WHERE id=$1 AND project_id=$2` check is genuinely
+ * tenant-scoped: an id owned by B is invisible to A and vice versa. INSERTs read
+ * the project_id ($2) from the query params, so whichever key created a preview
+ * is recorded as its owner.
+ *
+ * `query()` records every call into `db.calls` ([text, params] pairs) so tests
+ * can assert that e.g. a revoked key never reaches the ownership SELECT.
  *
  * @param {Object} [opts]
  * @param {{plan:string,status:string,data:object}|null} [opts.entitlementsRow]
  *   Row returned by the entitlements SELECT, or null ⇒ 0 rows ⇒ FREE.
- * @param {number} [opts.activeCount] count(*) returned for the previews count.
+ * @param {number | ((projectId:string)=>number)} [opts.activeCount]
+ *   count(*) for the previews count. A function is called with the project_id
+ *   ($1) so per-tenant caps can be modeled independently.
  * @param {boolean} [opts.throwOnAuth] make the api_keys lookup throw (DB outage).
+ * @param {boolean} [opts.throwOnEntitlements] make the entitlements lookup throw.
+ * @param {boolean} [opts.throwOnCount] make the active-preview count throw.
+ * @param {boolean} [opts.throwOnOwnership] make the `SELECT 1 FROM previews`
+ *   ownership check throw (tenant-gate DB outage on GET/PUT/DELETE).
  * @param {string[]} [opts.allowedOrigins] projects.allowed_origins.
  */
 const makeFakeDb = (opts = {}) => {
@@ -142,16 +170,23 @@ const makeFakeDb = (opts = {}) => {
     entitlementsRow = null,
     activeCount = 0,
     throwOnAuth = false,
+    throwOnEntitlements = false,
+    throwOnCount = false,
+    throwOnOwnership = false,
     allowedOrigins = [],
   } = opts
-  // Ids of previews INSERTed during the test, so ownership SELECTs can succeed.
-  const ownedPreviews = new Set()
+  // Map<previewId, owningProjectId> — every preview's true tenant owner.
+  const ownedPreviews = new Map()
+  // Every query() invocation, for spying (e.g. "no ownership query was made").
+  const calls = []
   return {
     ownedPreviews,
+    calls,
     async ping() {
       return true
     },
     async query(text, params) {
+      calls.push([text, params])
       if (throwOnAuth && text.includes('FROM api_keys')) {
         throw new Error('connection refused')
       }
@@ -186,30 +221,66 @@ const makeFakeDb = (opts = {}) => {
             ],
           }
         }
-        return { rows: [] } // unknown / revoked
+        if (hash === SECRET_HASH_B) {
+          return {
+            rows: [
+              {
+                key_id: 'key-secret-b',
+                type: 'secret',
+                project_id: PROJECT_B,
+                org_id: ORG_B,
+                namespace: 'proj-b',
+                allowed_origins: allowedOrigins,
+              },
+            ],
+          }
+        }
+        if (hash === PUBLISHABLE_HASH_B) {
+          return {
+            rows: [
+              {
+                key_id: 'key-pub-b',
+                type: 'publishable',
+                project_id: PROJECT_B,
+                org_id: ORG_B,
+                namespace: 'proj-b',
+                allowed_origins: allowedOrigins,
+              },
+            ],
+          }
+        }
+        return { rows: [] } // unknown / revoked (indistinguishable by design)
       }
       // ── entitlements lookup ──
       if (text.includes('FROM entitlements')) {
+        if (throwOnEntitlements) throw new Error('connection refused')
         return { rows: entitlementsRow ? [entitlementsRow] : [] }
       }
-      // ── active preview count ──
+      // ── active preview count (project-scoped: params[0] = project_id) ──
       if (text.includes('count(*)') && text.includes('FROM previews')) {
-        return { rows: [{ n: activeCount }] }
+        if (throwOnCount) throw new Error('connection refused')
+        const n =
+          typeof activeCount === 'function' ? activeCount(params[0]) : activeCount
+        return { rows: [{ n }] }
       }
-      // ── preview ownership check ──
+      // ── preview ownership check (tenant gate): id=$1 AND project_id=$2 ──
       if (text.startsWith('SELECT 1 FROM previews')) {
+        if (throwOnOwnership) throw new Error('connection refused')
         const id = params[0]
         const proj = params[1]
-        return { rows: ownedPreviews.has(id) && proj === PROJECT_A ? [{ '?column?': 1 }] : [] }
+        const owned = ownedPreviews.get(id) === proj
+        return { rows: owned ? [{ '?column?': 1 }] : [] }
       }
-      // ── bookkeeping INSERT ──
+      // ── bookkeeping INSERT: record (id → owning project_id from $2) ──
       if (text.startsWith('INSERT INTO previews')) {
-        ownedPreviews.add(params[0])
+        ownedPreviews.set(params[0], params[1])
         return { rows: [] }
       }
-      // ── bookkeeping DELETE ──
+      // ── bookkeeping DELETE (tenant-scoped: only drop when project matches) ──
       if (text.startsWith('DELETE FROM previews')) {
-        ownedPreviews.delete(params[0])
+        const id = params[0]
+        const proj = params[1]
+        if (ownedPreviews.get(id) === proj) ownedPreviews.delete(id)
         return { rows: [] }
       }
       return { rows: [] }
@@ -230,6 +301,11 @@ const makeHostedApp = async (dbOpts = {}) => {
 const bearer = (key) => ({ Authorization: `Bearer ${key}` })
 const jsonAuth = (body, key) => ({
   method: 'POST',
+  headers: { 'Content-Type': 'application/json', ...bearer(key) },
+  body: JSON.stringify(body),
+})
+const putAuth = (body, key) => ({
+  method: 'PUT',
   headers: { 'Content-Type': 'application/json', ...bearer(key) },
   body: JSON.stringify(body),
 })
@@ -415,5 +491,180 @@ describe('hosted mode — tenant isolation', () => {
     const app = createServer({ store, config, db })
     const res = await app.request('/preview/foreign-id', { headers: bearer(SECRET_KEY) })
     assert.equal(res.status, 404)
+  })
+})
+
+describe('hosted mode — cross-tenant isolation', () => {
+  // A single hosted app + fake db shared by both tenants A and B. Key A and
+  // key B hit the SAME server; the db ownership Map is the only thing that keeps
+  // their previews apart, so this exercises the real tenant gate end to end.
+  const A_BG = '#aaaaaa'
+  const ORIGINAL_TOKENS = { '--btn-bg': A_BG }
+  const seedAsA = async (app) => {
+    const post = await app.request('/preview', jsonAuth(ORIGINAL_TOKENS, SECRET_KEY))
+    assert.equal(post.status, 200)
+    const { id } = await post.json()
+    return id
+  }
+
+  it('READ isolation: B GET on A\'s preview → 404, byte-identical to a truly-absent id (no existence leak)', async () => {
+    const { app } = await makeHostedApp()
+    const id = await seedAsA(app)
+
+    const foreign = await app.request(`/preview/${id}`, { headers: bearer(SECRET_KEY_B) })
+    const absent = await app.request('/preview/totally-absent-id', { headers: bearer(SECRET_KEY_B) })
+
+    assert.equal(foreign.status, 404)
+    assert.equal(absent.status, 404)
+    // Existence-leak parity: same status AND byte-identical body — B cannot tell
+    // "A owns this" apart from "no such preview".
+    assert.equal(foreign.status, absent.status)
+    assert.deepEqual(await foreign.json(), await absent.json())
+  })
+
+  it('READ isolation: A still sees its OWN preview (200, original tokens)', async () => {
+    const { app } = await makeHostedApp()
+    const id = await seedAsA(app)
+    const res = await app.request(`/preview/${id}`, { headers: bearer(SECRET_KEY) })
+    assert.equal(res.status, 200)
+    const tokens = await res.json()
+    assert.equal(tokens['--btn-bg'], A_BG)
+  })
+
+  it('PUT isolation: B PUT on A\'s preview → 404 and A\'s tokens are UNCHANGED', async () => {
+    const { app } = await makeHostedApp()
+    const id = await seedAsA(app)
+
+    const put = await app.request(`/preview/${id}`, putAuth({ '--btn-bg': '#000000' }, SECRET_KEY_B))
+    assert.equal(put.status, 404)
+
+    // No cross-tenant mutation: A reads its original value back.
+    const after = await app.request(`/preview/${id}`, { headers: bearer(SECRET_KEY) })
+    assert.equal(after.status, 200)
+    assert.equal((await after.json())['--btn-bg'], A_BG)
+  })
+
+  it('DELETE isolation: B DELETE on A\'s preview → 404 and A\'s preview survives', async () => {
+    const { app, db } = await makeHostedApp()
+    const id = await seedAsA(app)
+
+    const del = await app.request(`/preview/${id}`, { method: 'DELETE', headers: bearer(SECRET_KEY_B) })
+    assert.equal(del.status, 404)
+
+    // No cross-tenant deletion: ownership row intact + A can still read it.
+    assert.equal(db.ownedPreviews.get(id), PROJECT_A)
+    const after = await app.request(`/preview/${id}`, { headers: bearer(SECRET_KEY) })
+    assert.equal(after.status, 200)
+  })
+
+  it('store-has-but-not-owned: GET/PUT/DELETE all 404 even when the store entry exists', async () => {
+    // Store entry present, but no ownership row for B ⇒ the db gate (not the
+    // store) decides. All three verbs must 404.
+    const config = loadConfig({ ...process.env, DATABASE_URL: 'postgres://fake/db' })
+    const store = await createMemoryStore(config)
+    openStores.push(store)
+    await store.putPreview('shared-id', { '--x': '1' })
+    const db = makeFakeDb() // ownership Map empty
+    const app = createServer({ store, config, db })
+
+    const get = await app.request('/preview/shared-id', { headers: bearer(SECRET_KEY_B) })
+    assert.equal(get.status, 404)
+    const put = await app.request('/preview/shared-id', putAuth({ '--x': '2' }, SECRET_KEY_B))
+    assert.equal(put.status, 404)
+    const del = await app.request('/preview/shared-id', { method: 'DELETE', headers: bearer(SECRET_KEY_B) })
+    assert.equal(del.status, 404)
+  })
+
+  it('scope vs tenancy compose: publishable-A on B\'s preview → 404 (tenant gate); publishable-A on A\'s own → 403 read_only (scope gate)', async () => {
+    const { app } = await makeHostedApp()
+    const id = await seedAsA(app)
+
+    // A publishable key for project B reading A's preview: tenant gate ⇒ 404
+    // (not 403, not 200) — tenancy is enforced independently of read scope.
+    const crossTenantRead = await app.request(`/preview/${id}`, { headers: bearer(PUBLISHABLE_KEY_B) })
+    assert.equal(crossTenantRead.status, 404)
+
+    // A publishable key for project A WRITING A's own preview: scope gate ⇒ 403.
+    const ownWrite = await app.request(`/preview/${id}`, putAuth({ '--btn-bg': '#111111' }, PUBLISHABLE_KEY))
+    assert.equal(ownWrite.status, 403)
+    assert.equal((await ownWrite.json()).code, 'read_only')
+  })
+
+  it('revoked / unknown key → 401 and never reaches the tenant ownership query', async () => {
+    const { app, db } = await makeHostedApp()
+    const id = await seedAsA(app)
+    db.calls.length = 0 // reset spy after seeding
+
+    const res = await app.request(`/preview/${id}`, { headers: bearer('sk_revoked_or_unknown') })
+    assert.equal(res.status, 401)
+    assert.equal((await res.json()).code, 'unauthorized')
+
+    // Auth failed up front: no ownership SELECT was ever attempted.
+    const ownershipQueried = db.calls.some(([text]) => text.startsWith('SELECT 1 FROM previews'))
+    assert.equal(ownershipQueried, false)
+  })
+
+  it('fail-closed: ownership SELECT throws → GET/PUT/DELETE all 503 db_unavailable (never 404/200, no cross-tenant open)', async () => {
+    const config = loadConfig({ ...process.env, DATABASE_URL: 'postgres://fake/db' })
+    const store = await createMemoryStore(config)
+    openStores.push(store)
+    await store.putPreview('some-id', { '--x': '1' })
+    const db = makeFakeDb({ throwOnOwnership: true })
+    const app = createServer({ store, config, db })
+
+    const get = await app.request('/preview/some-id', { headers: bearer(SECRET_KEY) })
+    assert.equal(get.status, 503)
+    assert.equal((await get.json()).code, 'db_unavailable')
+
+    const put = await app.request('/preview/some-id', putAuth({ '--x': '2' }, SECRET_KEY))
+    assert.equal(put.status, 503)
+    assert.equal((await put.json()).code, 'db_unavailable')
+
+    const del = await app.request('/preview/some-id', { method: 'DELETE', headers: bearer(SECRET_KEY) })
+    assert.equal(del.status, 503)
+    assert.equal((await del.json()).code, 'db_unavailable')
+  })
+
+  it('fail-closed: entitlements lookup throws → POST /preview → 503 db_unavailable', async () => {
+    const { app } = await makeHostedApp({ throwOnEntitlements: true })
+    const res = await app.request('/preview', jsonAuth({ '--btn-bg': '#abc' }, SECRET_KEY))
+    assert.equal(res.status, 503)
+    assert.equal((await res.json()).code, 'db_unavailable')
+  })
+
+  it('fail-closed: active-preview count throws → POST /preview → 503 db_unavailable', async () => {
+    // Capped plan ⇒ the count path runs; force it to throw.
+    const { app } = await makeHostedApp({
+      entitlementsRow: { plan: 'team', status: 'active', data: { maxActivePreviews: 3 } },
+      throwOnCount: true,
+    })
+    const res = await app.request('/preview', jsonAuth({ '--btn-bg': '#abc' }, SECRET_KEY))
+    assert.equal(res.status, 503)
+    assert.equal((await res.json()).code, 'db_unavailable')
+  })
+
+  it('count isolation: A at its cap does NOT block B (count is project-scoped on $1)', async () => {
+    // Same capped entitlements row for both orgs (FREE fallback would be -1 =
+    // unlimited and skip the count entirely, so give both a finite cap). A is
+    // already at the cap; B is empty. The count query reads project_id ($1), so
+    // A → 3 (blocked), B → 0 (allowed).
+    const { app, db } = await makeHostedApp({
+      entitlementsRow: { plan: 'team', status: 'active', data: { maxActivePreviews: 3 } },
+      activeCount: (projectId) => (projectId === PROJECT_A ? 3 : 0),
+    })
+
+    const aRes = await app.request('/preview', jsonAuth({ '--btn-bg': '#abc' }, SECRET_KEY))
+    assert.equal(aRes.status, 402)
+    assert.equal((await aRes.json()).code, 'preview_limit')
+
+    const bRes = await app.request('/preview', jsonAuth({ '--btn-bg': '#abc' }, SECRET_KEY_B))
+    assert.equal(bRes.status, 200)
+
+    // Defense-in-depth: the count query that allowed B was scoped to B's project.
+    const countCallForB = db.calls.some(
+      ([text, params]) =>
+        text.includes('count(*)') && text.includes('FROM previews') && params[0] === PROJECT_B,
+    )
+    assert.equal(countCallForB, true)
   })
 })

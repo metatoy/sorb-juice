@@ -45,6 +45,12 @@ import { getEntitlements, effectiveEntitlements, FREE } from './entitlements.js'
  * @param {(storyId: string) => (object | null)} [options.getArtifact]
  *   Artifact JSON for a story id (looked up via the index — never a raw path),
  *   or null. Defaults to () => null.
+ * @param {(err: unknown, context?: Record<string, unknown>) => void} [options.onError]
+ *   Optional error sink for the DB-error / best-effort catch paths. Threaded in
+ *   (dependency-injection style, mirroring db/store) so this module stays
+ *   Sentry-import-free and fake-db testable. Defaults to a no-op; cli.js `serve`
+ *   passes `captureError` from src/sentry.js (itself a no-op when SENTRY_DSN is
+ *   unset). The test harness omits it, so capture stays a no-op under `node --test`.
  * @returns {import('hono').Hono} the Hono app (synchronous — /ready does its
  *   async backend checks per-request).
  */
@@ -56,6 +62,7 @@ export const createServer = ({
   getResolvedTokens = () => null,
   getArtifactIndex = () => null,
   getArtifact = () => null,
+  onError = () => {},
 }) => {
   const namespace = config.namespace
   const corsOrigin =
@@ -100,6 +107,7 @@ export const createServer = ({
       } catch (e) {
         // DB outage during auth lookup — fail CLOSED, never fall through to
         // open/local behavior.
+        onError(e, { at: 'auth' })
         return c.json({ error: 'Service unavailable', code: 'db_unavailable' }, 503)
       }
       if (!ctx) {
@@ -112,6 +120,7 @@ export const createServer = ({
       try {
         ent = effectiveEntitlements(await getEntitlements(db, ctx.orgId))
       } catch (e) {
+        onError(e, { at: 'entitlements' })
         return c.json({ error: 'Service unavailable', code: 'db_unavailable' }, 503)
       }
       c.set('ent', ent)
@@ -205,6 +214,7 @@ export const createServer = ({
         try {
           active = await activePreviewCount(ctx.projectId)
         } catch (e) {
+          onError(e, { at: 'preview.count' })
           return c.json({ error: 'Service unavailable', code: 'db_unavailable' }, 503)
         }
         if (active >= ent.maxActivePreviews) {
@@ -234,7 +244,9 @@ export const createServer = ({
         )
       } catch (e) {
         // Best-effort bookkeeping: the preview is already in the store. A failed
-        // insert only affects future counting; do not fail the request.
+        // insert only affects future counting; do not fail the request. Report
+        // it so silent bookkeeping drift is observable.
+        onError(e, { at: 'preview.bookkeeping.insert', id })
       }
 
       const url = `?preview=${id}`
@@ -269,6 +281,7 @@ export const createServer = ({
         )
         owned = Boolean(res && res.rows && res.rows.length)
       } catch (e) {
+        onError(e, { at: 'preview.owner', method: 'GET', id })
         return c.json({ error: 'Service unavailable', code: 'db_unavailable' }, 503)
       }
       if (!owned) {
@@ -295,6 +308,7 @@ export const createServer = ({
         )
         owned = Boolean(res && res.rows && res.rows.length)
       } catch (e) {
+        onError(e, { at: 'preview.owner', method: 'PUT', id })
         return c.json({ error: 'Service unavailable', code: 'db_unavailable' }, 503)
       }
       if (!owned) {
@@ -327,6 +341,7 @@ export const createServer = ({
         )
         owned = Boolean(res && res.rows && res.rows.length)
       } catch (e) {
+        onError(e, { at: 'preview.owner', method: 'DELETE', id })
         return c.json({ error: 'Service unavailable', code: 'db_unavailable' }, 503)
       }
       if (!owned) {
@@ -337,7 +352,8 @@ export const createServer = ({
         await db.query('DELETE FROM previews WHERE id = $1 AND project_id = $2', [id, ctx.projectId])
       } catch (e) {
         // Best-effort: the store entry is gone; a stale bookkeeping row only
-        // affects future counting and will TTL out.
+        // affects future counting and will TTL out. Report so drift is visible.
+        onError(e, { at: 'preview.bookkeeping.delete', id })
       }
       return c.json({ deleted: true })
     }
