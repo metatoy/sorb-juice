@@ -162,6 +162,63 @@ program
     })
   })
 
+// ─── serve (hosted bridge) ──────────────────────────────────────────────────
+// Hosted mode: config comes entirely from env (loadConfig — 12-factor). No
+// sorb.config.json, no token-file watching, no Style Dictionary build (those are
+// local-dev concerns). Serves previews + verify (the hosted wedge). This is the
+// container entry point (Dockerfile CMD).
+
+program
+  .command('serve')
+  .description('Run the hosted bridge server (config from env; no sorb.config.json)')
+  .action(async () => {
+    const config = loadConfig()
+    const port = config.port
+
+    console.log(pc.bold('\nSorb (hosted bridge)'))
+    console.log(pc.dim('  Namespace :') + ` ${config.namespace}`)
+    console.log(pc.dim('  Port      :') + ` ${port}`)
+    console.log(pc.dim('  Redis     :') + ` ${config.redisUrl ? 'on' : 'off (in-memory)'}`)
+    console.log(pc.dim('  Postgres  :') + ` ${config.databaseUrl ? 'on' : 'off'}`)
+
+    const store = await createStore(config)
+
+    // DB init is best-effort: a Postgres hiccup must not crash-loop the bridge,
+    // since previews/verify live in the store (Redis), not Postgres.
+    let db = null
+    try {
+      db = await createDb(config)
+      if (db && db.runMigrations) await db.runMigrations()
+    } catch (e) {
+      console.error(pc.yellow('  ⚠ Postgres init failed; continuing without DB: ') + e.message)
+      db = null
+    }
+
+    // No local project files in hosted mode → token/artifact getters are empty
+    // for now (hosted token serving is a later phase; previews are the wedge).
+    const app = createServer({
+      store,
+      config,
+      db,
+      getLatestTokens: () => ({}),
+      getResolvedTokens: () => null,
+      getArtifactIndex: () => null,
+      getArtifact: () => null,
+    })
+
+    serve({ fetch: app.fetch, port, hostname: '0.0.0.0' }, () => {
+      console.log(pc.dim(`\n  Listening on 0.0.0.0:${port}  ·  /health  /ready\n`))
+    })
+
+    const shutdown = async () => {
+      try { await store.close() } catch (e) { /* best-effort shutdown */ }
+      if (db) { try { await db.close() } catch (e) { /* best-effort shutdown */ } }
+      process.exit(0)
+    }
+    process.on('SIGINT', shutdown)
+    process.on('SIGTERM', shutdown)
+  })
+
 // ─── init ─────────────────────────────────────────────────────────────────────
 
 program
