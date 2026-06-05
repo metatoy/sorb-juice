@@ -2,7 +2,7 @@ name: Publish to npm
 
 # Fires when you publish a GitHub Release tagged vX.Y.Z (the tag's version
 # must match package.json). Builds (if the package has a build) and publishes
-# to npm under the @metatoy scope with provenance.
+# to npm under the @sorb scope with provenance.
 on:
   release:
     types: [published]
