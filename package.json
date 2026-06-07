@@ -1,6 +1,6 @@
 {
   "name": "@sorb/juice",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Local token bridge server and dev tooling for Sorb — the live conduit carrying tokens across (CLI command: sorb)",
   "license": "MIT",
   "keywords": [
