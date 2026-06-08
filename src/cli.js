@@ -136,18 +136,21 @@ program
       getArtifact: readArtifact,
     })
 
-    serve({ fetch: app.fetch, port }, () => {
+    // C2: bind the local bridge to 127.0.0.1 only (loopback), NOT 0.0.0.0
+    // (all interfaces). @hono/node-server defaults to 0.0.0.0 when hostname is
+    // omitted, which would expose the no-auth/open-CORS dev bridge to the LAN.
+    serve({ fetch: app.fetch, port, hostname: '127.0.0.1' }, () => {
       console.log(
         pc.dim('\n  Preview URL :') +
-          pc.cyan(` http://localhost:${port}/preview`),
+          pc.cyan(` http://127.0.0.1:${port}/preview`),
       )
       console.log(
         pc.dim('  Latest      :') +
-          pc.cyan(` http://localhost:${port}/tokens/latest`),
+          pc.cyan(` http://127.0.0.1:${port}/tokens/latest`),
       )
       console.log(
         pc.dim('  Health      :') +
-          pc.cyan(` http://localhost:${port}/health`),
+          pc.cyan(` http://127.0.0.1:${port}/health`),
       )
       console.log(pc.dim('\n  Watching for token file changes...\n'))
     })
