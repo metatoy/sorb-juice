@@ -40,6 +40,9 @@
  * @property {string | undefined} databaseUrl postgres:// URL. Presence makes
  *   createDb build a Pool; undefined → no DB (local mode).
  * @property {string[] | '*'} corsOrigins Allowed CORS origins, or '*' (open).
+ * @property {string[]} [allowedWriteOrigins] Extra origins permitted to make
+ *   cross-site WRITES to /preview* in LOCAL mode (on top of the built-in
+ *   localhost/127.0.0.1 + Figma allowlist). Used by the P0.3b CSRF guard.
  * @property {number} previewTtlMs TTL for previews + verifications, in ms.
  * @property {number} pruneIntervalMs In-memory prune interval, in ms.
  */

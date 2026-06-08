@@ -156,6 +156,91 @@ export const createServer = ({
   } else {
     // LOCAL mode — today's open CORS, unchanged.
     app.use('*', cors({ origin: corsOrigin }))
+
+    // C2 (P0.3b): reject cross-site browser WRITES to /preview*. The local
+    // bridge is no-auth + open CORS, so a web page the dev visits while
+    // `sorb dev` runs could POST/PUT/DELETE a preview that the leaf SDK then
+    // injects into the running app (CSRF drive-by repaint / CSS-exfil).
+    //
+    // We allow the two LEGITIMATE writers and reject everything else:
+    //   - leaf SDK   (app localhost:5173 → bridge localhost:7777): same-site,
+    //     Sec-Fetch-Site: same-site → ALLOW.
+    //   - Figma plugin (canopy sandboxed iframe): Origin: null (opaque) or
+    //     https://www.figma.com → ALLOW (the one legit cross-site writer).
+    //   - curl / server-side SDK: no Origin header → ALLOW.
+    //   - a drive-by site (https://evil.com): Sec-Fetch-Site: cross-site +
+    //     a real Origin not on the allowlist → REJECT 403.
+    //
+    // Scoped to LOCAL mode only: the hosted bridge has remoteAuth + scoped CORS
+    // and registers a different middleware stack, so this never runs there.
+    const WRITE_METHODS = new Set(['POST', 'PUT', 'DELETE'])
+
+    // Default allowlist: localhost/127.0.0.1 (any scheme/port) + Figma origins.
+    // Consumers may extend via config.allowedWriteOrigins (array of origins).
+    const extraAllowed = Array.isArray(config.allowedWriteOrigins)
+      ? config.allowedWriteOrigins
+      : []
+    const allowedWriteOrigins = new Set([
+      'https://www.figma.com',
+      'https://figma.com',
+      ...extraAllowed,
+    ])
+
+    /**
+     * Is this an allowed write origin? Accepts the static allowlist plus any
+     * localhost / 127.0.0.1 / [::1] origin on any scheme + port (the SDK + the
+     * dev's own app live there).
+     * @param {string} origin
+     * @returns {boolean}
+     */
+    const isAllowedWriteOrigin = (origin) => {
+      if (allowedWriteOrigins.has(origin)) return true
+      let host
+      try {
+        host = new URL(origin).hostname
+      } catch (e) {
+        return false
+      }
+      return host === 'localhost' || host === '127.0.0.1' || host === '[::1]' || host === '::1'
+    }
+
+    app.use('/preview', crossSiteWriteGuard)
+    app.use('/preview/:id', crossSiteWriteGuard)
+
+    /**
+     * Hono middleware: 403 a cross-site browser write to /preview*. READS (GET)
+     * and non-write methods pass straight through.
+     * @param {import('hono').Context} c
+     * @param {() => Promise<void>} next
+     */
+    async function crossSiteWriteGuard(c, next) {
+      if (!WRITE_METHODS.has(c.req.method)) return next()
+
+      const origin = c.req.header('Origin')
+      const fetchSite = c.req.header('Sec-Fetch-Site')
+
+      // No Origin (curl / server-side SDK) ⇒ not a browser cross-site write.
+      if (origin === undefined || origin === null) return next()
+      // Opaque origin (sandboxed Figma plugin iframe) ⇒ allow.
+      if (origin === 'null') return next()
+      // Same-origin / same-site / direct navigation ⇒ allow (leaf SDK is
+      // same-site: localhost:5173 → localhost:7777).
+      if (fetchSite === 'same-origin' || fetchSite === 'same-site' || fetchSite === 'none') {
+        return next()
+      }
+      // Explicitly allowlisted origin (localhost/127.0.0.1/Figma/extra) ⇒ allow.
+      if (isAllowedWriteOrigin(origin)) return next()
+      // A real cross-site write from an untrusted web origin ⇒ block.
+      if (fetchSite === 'cross-site') {
+        return c.json({ error: 'cross-site write blocked' }, 403)
+      }
+      // No Sec-Fetch-Site header (older clients / non-browser) but a real,
+      // non-allowlisted Origin: be conservative but non-breaking — allow,
+      // since legitimate non-browser writers may set Origin without Sec-Fetch-*.
+      // The cross-site case above is the CSRF drive-by we must block; browsers
+      // that omit Sec-Fetch-Site are pre-2020 and out of scope here.
+      return next()
+    }
   }
 
   // Scope guard: WRITE ops require a 'secret' key. Returns a Response (the 403)

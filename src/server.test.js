@@ -668,3 +668,134 @@ describe('hosted mode — cross-tenant isolation', () => {
     assert.equal(countCallForB, true)
   })
 })
+
+// ─── LOCAL MODE — P0.3b cross-site write guard (C2 CSRF drive-by) ─────────────
+// The local (no-auth, open-CORS) bridge must reject cross-site browser writes
+// to /preview* from untrusted web origins, WITHOUT breaking the two legitimate
+// writers: the leaf SDK (same-site localhost) and the Figma plugin (Origin:
+// null / figma.com). Reads (GET) are never blocked. Hosted mode is unaffected.
+describe('local mode — cross-site write guard (C2)', () => {
+  // A write with explicit Origin + Sec-Fetch-Site headers, like a browser sends.
+  const writeWith = (method, headers, body = { '--btn-bg': '#abc' }) => ({
+    method,
+    headers: { 'Content-Type': 'application/json', ...headers },
+    body: JSON.stringify(body),
+  })
+
+  it('(a) POST /preview from a cross-site untrusted origin → 403', async () => {
+    const app = await makeApp()
+    const res = await app.request(
+      '/preview',
+      writeWith('POST', { Origin: 'https://evil.com', 'Sec-Fetch-Site': 'cross-site' }),
+    )
+    assert.equal(res.status, 403)
+    assert.equal((await res.json()).error, 'cross-site write blocked')
+  })
+
+  it('(b) POST /preview with Origin: null (sandboxed Figma plugin) → allowed', async () => {
+    const app = await makeApp()
+    const res = await app.request(
+      '/preview',
+      writeWith('POST', { Origin: 'null', 'Sec-Fetch-Site': 'cross-site' }),
+    )
+    assert.equal(res.status, 200)
+    const body = await res.json()
+    assert.equal(typeof body.id, 'string')
+  })
+
+  it('(c1) POST /preview with Sec-Fetch-Site: same-site (leaf SDK) → allowed', async () => {
+    const app = await makeApp()
+    const res = await app.request(
+      '/preview',
+      writeWith('POST', { Origin: 'http://localhost:5173', 'Sec-Fetch-Site': 'same-site' }),
+    )
+    assert.equal(res.status, 200)
+  })
+
+  it('(c2) POST /preview from a localhost origin (SDK) is allowlisted even if Sec-Fetch-Site says cross-site', async () => {
+    const app = await makeApp()
+    const res = await app.request(
+      '/preview',
+      writeWith('POST', { Origin: 'http://localhost:5173', 'Sec-Fetch-Site': 'cross-site' }),
+    )
+    assert.equal(res.status, 200)
+  })
+
+  it('(d) POST /preview with NO Origin header (curl) → allowed', async () => {
+    const app = await makeApp()
+    const res = await app.request('/preview', jsonInit({ '--btn-bg': '#abc' }))
+    assert.equal(res.status, 200)
+  })
+
+  it('(e) POST /preview with Origin: https://www.figma.com → allowed', async () => {
+    const app = await makeApp()
+    const res = await app.request(
+      '/preview',
+      writeWith('POST', { Origin: 'https://www.figma.com', 'Sec-Fetch-Site': 'cross-site' }),
+    )
+    assert.equal(res.status, 200)
+  })
+
+  it('(f) GET /preview/:id is NEVER blocked by the guard (cross-site read passes)', async () => {
+    const app = await makeApp()
+    // Seed a preview, then read it cross-site — read must not 403.
+    const post = await app.request('/preview', jsonInit({ '--btn-bg': '#abc' }))
+    const { id } = await post.json()
+    const res = await app.request(`/preview/${id}`, {
+      headers: { Origin: 'https://evil.com', 'Sec-Fetch-Site': 'cross-site' },
+    })
+    assert.equal(res.status, 200)
+    assert.equal((await res.json())['--btn-bg'], '#abc')
+  })
+
+  it('PUT /preview/:id cross-site untrusted origin → 403', async () => {
+    const app = await makeApp()
+    const post = await app.request('/preview', jsonInit({ '--btn-bg': '#abc' }))
+    const { id } = await post.json()
+    const res = await app.request(
+      `/preview/${id}`,
+      writeWith('PUT', { Origin: 'https://evil.com', 'Sec-Fetch-Site': 'cross-site' }),
+    )
+    assert.equal(res.status, 403)
+    assert.equal((await res.json()).error, 'cross-site write blocked')
+  })
+
+  it('DELETE /preview/:id cross-site untrusted origin → 403', async () => {
+    const app = await makeApp()
+    const post = await app.request('/preview', jsonInit({ '--btn-bg': '#abc' }))
+    const { id } = await post.json()
+    const res = await app.request(`/preview/${id}`, {
+      method: 'DELETE',
+      headers: { Origin: 'https://evil.com', 'Sec-Fetch-Site': 'cross-site' },
+    })
+    assert.equal(res.status, 403)
+  })
+
+  it('config.allowedWriteOrigins extends the allowlist (a staging origin is allowed)', async () => {
+    const config = loadConfig()
+    const store = await createMemoryStore({ ...config, allowedWriteOrigins: ['https://staging.example.com'] })
+    openStores.push(store)
+    const app = createServer({
+      store,
+      config: { ...config, allowedWriteOrigins: ['https://staging.example.com'] },
+    })
+    const res = await app.request(
+      '/preview',
+      writeWith('POST', { Origin: 'https://staging.example.com', 'Sec-Fetch-Site': 'cross-site' }),
+    )
+    assert.equal(res.status, 200)
+  })
+
+  it('(g) hosted mode is UNAFFECTED by the local guard (cross-site write reaches auth → 401, not the 403 guard)', async () => {
+    // In hosted mode the guard is never registered. A cross-site write with NO
+    // key hits the hosted auth middleware first → 401 unauthorized, proving the
+    // local 403 "cross-site write blocked" guard did not run.
+    const { app } = await makeHostedApp()
+    const res = await app.request(
+      '/preview',
+      writeWith('POST', { Origin: 'https://evil.com', 'Sec-Fetch-Site': 'cross-site' }),
+    )
+    assert.equal(res.status, 401)
+    assert.equal((await res.json()).code, 'unauthorized')
+  })
+})
