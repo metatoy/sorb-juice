@@ -2,7 +2,7 @@ name: Publish to npm
 
 # Fires when you publish a GitHub Release tagged vX.Y.Z (the tag's version
 # must match package.json). Builds (if the package has a build) and publishes
-# to npm under the @sorb scope with provenance.
+# to npm under the @metatoy scope with provenance.
 on:
   release:
     types: [published]
@@ -39,7 +39,14 @@ jobs:
 
       # prepublishOnly builds dist/ for packages that have a build step;
       # src-only packages just publish their files.
+      # A pre-release Release publishes to the 'rc' dist-tag; a normal Release stays 'latest'.
       - name: Publish
-        run: npm publish --provenance --access public
+        run: |
+          if [ "${{ github.event.release.prerelease }}" = "true" ]; then
+            echo "Pre-release → publishing to the 'rc' dist-tag"
+            npm publish --provenance --access public --tag rc
+          else
+            npm publish --provenance --access public
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
