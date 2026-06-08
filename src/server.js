@@ -100,6 +100,15 @@ export const createServer = ({
   // configured (default 24h) window for Free orgs.
   const previewTtlMs = config.previewTtlMs || 86_400_000
 
+  // Activity log: namespace → [{displayName, verifiedAt}], max 20 entries, 24h TTL.
+  const activityLog = new Map()
+  const ACTIVITY_MAX = 20
+  const ACTIVITY_TTL_MS = 24 * 60 * 60 * 1000
+  const pruneActivity = (entries) => {
+    const cutoff = Date.now() - ACTIVITY_TTL_MS
+    return entries.filter((e) => Date.parse(e.verifiedAt) > cutoff).slice(-ACTIVITY_MAX)
+  }
+
   const app = new Hono()
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -644,6 +653,31 @@ export const createServer = ({
       return c.json({ error: 'Verification not found or expired' }, 404)
     }
     return c.json(entry)
+  })
+
+  // ─── POST /verify/activity ───────────────────────────────────────────────
+  // Record that the current Figma user just ran a preview. Non-critical — no
+  // auth gate (same as /health) since it carries no secrets (display name only).
+  app.post('/verify/activity', async (c) => {
+    const body = await c.req.json().catch(() => ({}))
+    const displayName = typeof body.displayName === 'string' ? body.displayName.slice(0, 64) : null
+    if (!displayName) return c.json({ error: 'displayName required' }, 400)
+    const ns = c.get('namespace') || namespace
+    const entries = pruneActivity(activityLog.get(ns) || [])
+    entries.push({ displayName, verifiedAt: new Date().toISOString() })
+    activityLog.set(ns, entries)
+    return c.json({ ok: true })
+  })
+
+  // ─── GET /verify/activity ────────────────────────────────────────────────
+  // Returns the most recent *other* user's activity entry (exclude= self).
+  app.get('/verify/activity', (c) => {
+    const ns = c.get('namespace') || namespace
+    const exclude = c.req.query('exclude') || null
+    const entries = pruneActivity(activityLog.get(ns) || [])
+    const others = exclude ? entries.filter((e) => e.displayName !== exclude) : entries
+    const latest = others.length > 0 ? others[others.length - 1] : null
+    return c.json({ latest })
   })
 
   // ─── GET /tokens/latest ───────────────────────────────────────────────────
