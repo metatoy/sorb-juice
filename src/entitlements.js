@@ -27,6 +27,7 @@
  * @property {number} maxProjects        -1 = unlimited
  * @property {number} maxActivePreviews  -1 = unlimited
  * @property {boolean} captureEnabled
+ * @property {number} maxCustomDomains   -1 = unlimited; 0 = no custom domains (Free)
  */
 
 /**
@@ -45,6 +46,7 @@ export const FREE = Object.freeze({
   maxProjects: 1,
   maxActivePreviews: -1,
   captureEnabled: false,
+  maxCustomDomains: 0,
 })
 
 /**
@@ -99,6 +101,10 @@ export function normalizeEntitlements(row) {
         ? numOr(data.maxActivePreviews, FREE.maxActivePreviews)
         : FREE.maxActivePreviews,
     captureEnabled: 'captureEnabled' in data ? Boolean(data.captureEnabled) : FREE.captureEnabled,
+    maxCustomDomains:
+      'maxCustomDomains' in data
+        ? numOr(data.maxCustomDomains, FREE.maxCustomDomains)
+        : FREE.maxCustomDomains,
   }
 
   // Columns win for plan + status.
@@ -157,6 +163,7 @@ export function effectiveEntitlements(ent) {
       maxProjects: FREE.maxProjects,
       maxActivePreviews: FREE.maxActivePreviews,
       captureEnabled: FREE.captureEnabled,
+      maxCustomDomains: FREE.maxCustomDomains,
       plan: ent.plan,
       status: ent.status,
     })
