@@ -296,4 +296,62 @@ program
     }
   })
 
+// ─── mcp ────────────────────────────────────────────────────────────────────
+// Sorb MCP server (stdio): exposes the running app's resolved tokens + bound
+// React components to any MCP-capable agent (Claude Code / Cursor / Copilot).
+// Read-only (Phase 1) over the project's local `.sorb/` map — no `sorb dev`
+// needed. The SDK is imported LAZILY here so `dev`/`serve`/`init`/`commit` keep
+// working even when `@modelcontextprotocol/sdk` isn't installed. stdout is the
+// MCP channel — this command must not print to stdout.
+
+program
+  .command('mcp')
+  .description('Run the Sorb MCP server (stdio) — resolved tokens + component bindings for AI agents')
+  .option('--dir <path>', 'project dir whose .sorb/ is served', process.cwd())
+  .option('--bridge <url>', 'live bridge base URL for gated write previews (e.g. http://localhost:7777)')
+  .option('--http', 'run the hosted HTTP/SSE MCP endpoint (auth + tenant scoping; requires DATABASE_URL)')
+  .option('-p, --port <port>', 'port for the hosted --http endpoint', '7878')
+  .option('--base-dir <path>', 'per-project snapshot root for hosted --http mode', process.env.SORB_MCP_BASE_DIR || './.sorb-projects')
+  .option('--gh-owner <owner>', 'GitHub org or user for open_pr')
+  .option('--gh-repo <repo>', 'GitHub repo name for open_pr')
+  .option('--gh-pat <pat>', 'GitHub personal access token for open_pr')
+  .option('--gh-token-path <path>', 'token file path open_pr writes to', 'tokens/component.json')
+  .action(async (opts) => {
+    // Hosted HTTP/SSE mode (P3.0 transport + P3.1 auth). DATABASE_URL-gated —
+    // createDb returns null without it, and startMcpHttpServer refuses to boot.
+    // Lazily import so `dev`/`serve`/stdio never load the hosted SDK transport.
+    if (opts.http) {
+      const { startMcpHttpServer } = await import('./mcp/httpServer')
+      const config = loadConfig()
+      const db = await createDb(config)
+      if (db && db.runMigrations) await db.runMigrations()
+      const port = parseInt(opts.port, 10)
+      await startMcpHttpServer({
+        db,
+        config,
+        baseDir: resolve(opts.baseDir),
+        port,
+      })
+      console.log(pc.bold('\nSorb MCP (hosted HTTP/SSE)'))
+      console.log(pc.dim('  Endpoint :') + pc.cyan(` http://0.0.0.0:${port}/mcp`))
+      console.log(pc.dim('  SSE      :') + pc.cyan(` http://0.0.0.0:${port}/mcp/sse`))
+      console.log(pc.dim('  Base dir :') + ` ${resolve(opts.baseDir)}\n`)
+      return
+    }
+
+    const { startMcpServer } = await import('./mcp/server')
+    // Build github creds only when owner+repo+pat are all present; otherwise the
+    // gated open_pr tool degrades gracefully (returns { error }).
+    const github =
+      opts.ghOwner && opts.ghRepo && opts.ghPat
+        ? {
+            owner: opts.ghOwner,
+            repo: opts.ghRepo,
+            pat: opts.ghPat,
+            tokenPath: opts.ghTokenPath,
+          }
+        : undefined
+    await startMcpServer({ dir: resolve(opts.dir), bridge: opts.bridge, github })
+  })
+
 program.parse()
