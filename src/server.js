@@ -365,6 +365,11 @@ export const createServer = ({
   // Plugin posts the post-layout geometry of an inserted component so the
   // canvas can be reconciled against the captured artifact. Returns a short id.
   // WRITE op.
+  //
+  // In hosted mode: a best-effort INSERT into verify_events is written after
+  // the store write so the beta can measure weekly active verify runs per
+  // project (moat-proof retention metric R-0607-16). Like preview bookkeeping,
+  // a failed insert does not fail the request.
   app.post('/verify', async (c) => {
     if (hosted) {
       const denied = requireWrite(c)
@@ -373,6 +378,22 @@ export const createServer = ({
     const { storyId, bbox, meta } = await c.req.json()
     const id = nanoid(8)
     await store.putVerification(id, { storyId, bbox, meta })
+
+    if (hosted) {
+      const ctx = c.get('auth')
+      const boundFields = (meta && typeof meta.boundFields === 'number') ? meta.boundFields : null
+      try {
+        await db.query(
+          'INSERT INTO verify_events (project_id, story_id, bound_fields) VALUES ($1, $2, $3)',
+          [ctx.projectId, storyId ?? null, boundFields],
+        )
+      } catch (e) {
+        // Best-effort: the verify is already recorded in the store. A failed
+        // insert only affects telemetry; do not fail the request.
+        onError(e, { at: 'verify.telemetry.insert', id })
+      }
+    }
+
     return c.json({ id })
   })
 
