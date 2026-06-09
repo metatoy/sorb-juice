@@ -17,7 +17,14 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import { tools } from './tools.js'
+import { liveTools } from './liveTools.js'
 import { allowedTools, writeGateError } from './entitlementGate.js'
+
+// LIVE-app reads (liveTools.js, roadmap §3 "sees the running app") are offered
+// ONLY in local/stdio mode. They query the bridge UNAUTHENTICATED, so in the
+// hosted multi-tenant path (where a `gate` is present) they're withheld to avoid
+// cross-tenant/401 ambiguity — hosted live-reads need a separate auth-forwarded
+// design. Local stdio (no gate) = the dev's own running app, no auth: safe.
 
 /**
  * Build a Sorb MCP low-level `Server` with the `ListTools` + `CallTool`
@@ -53,8 +60,16 @@ export const buildMcpServer = (ctx = {}) => {
   // P3.2 entitlement gate: in hosted mode `ctx.gate` ({scope, ent, upgradeUrl})
   // filters the advertised set so a Free/read-only session never SEES the write
   // tools. stdio (no gate) advertises all tools — back-compat.
+  // Local stdio advertises static + live reads + writes; hosted advertises the
+  // write-gated static set only (live tools withheld — see the import note).
+  const advertised = gate ? allowedTools(tools, gate) : [...tools, ...liveTools]
+  // CallTool looks up in the full *callable* set so a write tool a read-only
+  // session can't see still resolves to the structured `read_only` error (not
+  // "Unknown tool"); live tools are callable only when ungated (stdio).
+  const callable = gate ? tools : [...tools, ...liveTools]
+
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: (gate ? allowedTools(tools, gate) : tools).map((t) => ({
+    tools: advertised.map((t) => ({
       name: t.name,
       description: t.description,
       inputSchema: t.inputSchema,
@@ -62,7 +77,7 @@ export const buildMcpServer = (ctx = {}) => {
   }))
 
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
-    const tool = tools.find((t) => t.name === req.params.name)
+    const tool = callable.find((t) => t.name === req.params.name)
     if (!tool) {
       return {
         isError: true,
