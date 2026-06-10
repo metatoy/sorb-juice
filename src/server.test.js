@@ -799,3 +799,78 @@ describe('local mode — cross-site write guard (C2)', () => {
     assert.equal((await res.json()).code, 'unauthorized')
   })
 })
+
+// ─── POST /verify/app — RUNNING-APP token verification (W2) ──────────────────
+describe('bridge POST /verify/app (running-app token verification)', () => {
+  const RESOLVED = [
+    { id: 'button.primary.bg.default', cssVar: '--button-primary-bg-default', value: '#0f65ef', tier: 'component', type: 'color' },
+    { id: 'color.action.primary', cssVar: '--color-action-primary', value: '#0f65ef', tier: 'semantic', type: 'color' },
+    { id: 'radius.control', cssVar: '--radius-control', value: '4px', tier: 'semantic', type: 'dimension' },
+  ]
+  const makeResolvedApp = async (resolved) => {
+    const config = loadConfig()
+    const store = await createMemoryStore(config)
+    openStores.push(store)
+    return createServer({
+      store,
+      config,
+      getLatestTokens: () => ({}),
+      getResolvedTokens: () => resolved,
+      getArtifactIndex: () => null,
+      getArtifact: () => null,
+    })
+  }
+
+  it('all reported values match the resolved map → ok:true', async () => {
+    const app = await makeResolvedApp(RESOLVED)
+    const res = await app.request('/verify/app', jsonInit({ values: { '--button-primary-bg-default': '#0f65ef', '--radius-control': '4px' } }))
+    assert.equal(res.status, 200)
+    const body = await res.json()
+    assert.equal(body.ok, true)
+    assert.equal(body.checked, 2)
+    assert.equal(body.matched, 2)
+    assert.deepEqual(body.mismatches, [])
+  })
+
+  it('a preview override (mismatch) → ok:false with the {cssVar, expected, got}', async () => {
+    const app = await makeResolvedApp(RESOLVED)
+    const res = await app.request('/verify/app', jsonInit({ values: { '--button-primary-bg-default': '#ff0000' } }))
+    const body = await res.json()
+    assert.equal(body.ok, false)
+    assert.equal(body.matched, 0)
+    assert.deepEqual(body.mismatches, [{ cssVar: '--button-primary-bg-default', expected: '#0f65ef', got: '#ff0000' }])
+  })
+
+  it('case/whitespace-insensitive match (#0F65EF == #0f65ef)', async () => {
+    const app = await makeResolvedApp(RESOLVED)
+    const res = await app.request('/verify/app', jsonInit({ values: { '--color-action-primary': '  #0F65EF ' } }))
+    assert.equal((await res.json()).ok, true)
+  })
+
+  it('unknown cssVars are reported in `unknown`, not counted as checked', async () => {
+    const app = await makeResolvedApp(RESOLVED)
+    const res = await app.request('/verify/app', jsonInit({ values: { '--nope': 'x', '--radius-control': '4px' } }))
+    const body = await res.json()
+    assert.deepEqual(body.unknown, ['--nope'])
+    assert.equal(body.checked, 1)
+    assert.equal(body.ok, true)
+  })
+
+  it('no resolved map built → 404', async () => {
+    const app = await makeResolvedApp(null)
+    const res = await app.request('/verify/app', jsonInit({ values: { '--x': 'y' } }))
+    assert.equal(res.status, 404)
+  })
+
+  it('missing/!object values → 400', async () => {
+    const app = await makeResolvedApp(RESOLVED)
+    assert.equal((await app.request('/verify/app', jsonInit({}))).status, 400)
+    assert.equal((await app.request('/verify/app', jsonInit({ values: [] }))).status, 400)
+  })
+
+  it('invalid JSON body → 400', async () => {
+    const app = await makeResolvedApp(RESOLVED)
+    const res = await app.request('/verify/app', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{not json' })
+    assert.equal(res.status, 400)
+  })
+})

@@ -505,6 +505,62 @@ export const createServer = ({
     return c.json(resolved)
   })
 
+  // ─── POST /verify/app ──────────────────────────────────────────────────────
+  // RUNNING-APP token verification (roadmap §3 / e2e-fix W2): the app reports the
+  // values it actually resolved for a set of tokens (`@sorb/leaf`'s `verifyResolved`
+  // reads them off `:root`), and the bridge diffs them against the committed
+  // resolved map. "verified" = the LIVE app resolves to the bound token values —
+  // not the Figma-side bbox geometry that POST /verify records. Reads the same
+  // resolved map as GET /tokens/resolved and writes nothing; in hosted mode the
+  // global auth middleware still gates it (only /health + /ready are open).
+  // NOTE: getResolvedTokens() is a single global map (no tenant scope) — fine for
+  // the local bridge; revisit before any multi-tenant hosted rollout.
+  app.post('/verify/app', async (c) => {
+    let body
+    try {
+      body = await c.req.json()
+    } catch (e) {
+      return c.json({ error: 'Invalid JSON body' }, 400)
+    }
+    const values = body && body.values
+    if (!values || typeof values !== 'object' || Array.isArray(values)) {
+      return c.json({ error: 'Missing { values: { "--token": "value" } }' }, 400)
+    }
+    const resolved = getResolvedTokens()
+    if (!resolved) {
+      return c.json(
+        { error: 'No resolved token map. Run `sorb-seed resolve` (Style Dictionary build).' },
+        404,
+      )
+    }
+    // cssVar -> resolved value, for O(1) lookup.
+    const want = new Map(resolved.map((t) => [t.cssVar, t.value]))
+    // Compare format-insensitively (lowercase + collapse whitespace) so e.g.
+    // `#0F65EF` matches `#0f65ef`. Exact-format MVP; richer color/dimension
+    // canonicalization (hex↔rgb, unit math) is a documented follow-up.
+    const norm = (v) => String(v == null ? '' : v).trim().toLowerCase().replace(/\s+/g, ' ')
+    const mismatches = []
+    const unknown = []
+    let matched = 0
+    for (const [cssVar, got] of Object.entries(values)) {
+      if (!want.has(cssVar)) {
+        unknown.push(cssVar)
+        continue
+      }
+      const expected = want.get(cssVar)
+      if (norm(got) === norm(expected)) matched++
+      else mismatches.push({ cssVar, expected, got })
+    }
+    const checked = matched + mismatches.length
+    return c.json({
+      ok: mismatches.length === 0 && checked > 0,
+      checked,
+      matched,
+      mismatches,
+      unknown,
+    })
+  })
+
   // ─── GET /artifacts ───────────────────────────────────────────────────────
   // The captured-component index — list of components/stories with hashes,
   // produced by `sorb-seed capture`. 404 until seed has run.
