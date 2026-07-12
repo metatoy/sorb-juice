@@ -1,8 +1,9 @@
 # @sorb/juice
 
-Local token bridge server and dev tooling for
-[Sorb](https://github.com/nhunsaker/sorb). A dev dependency only —
-it never touches production.
+Sorb bridge server + CLI (`sorb`) — carries proposed tokens from Figma into
+your running app. (Juice: the conduit.)
+
+A dev dependency only — it never touches production.
 
 ```bash
 npm install -D @sorb/juice
