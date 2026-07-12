@@ -1,7 +1,7 @@
 {
   "name": "@sorb/juice",
   "version": "0.2.0",
-  "description": "Local token bridge server and dev tooling for Sorb — the live conduit carrying tokens across (CLI command: sorb)",
+  "description": "Sorb bridge server + CLI (`sorb`) — carries proposed tokens from Figma into your running app. (Juice: the conduit.)",
   "license": "MIT",
   "keywords": [
     "sorb",
