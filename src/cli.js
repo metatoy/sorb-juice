@@ -31,30 +31,50 @@ const loadFileConfig = () => {
   return JSON.parse(readFileSync(configPath, 'utf-8'))
 }
 
+// ─── version ────────────────────────────────────────────────────────────────
+// Read the real version from package.json rather than hardcoding it (which
+// drifts). dist/cli.js lives in dist/, so package.json is one level up — the
+// same layout in-repo and in the published npm package (`files: ["dist"]`).
+
+const readPkgVersion = () => {
+  try {
+    const pkgPath = resolve(__dirname, '..', 'package.json')
+    return JSON.parse(readFileSync(pkgPath, 'utf-8')).version || '0.0.0'
+  } catch (e) {
+    return '0.0.0'
+  }
+}
+
 // ─── program ──────────────────────────────────────────────────────────────────
 
 program
   .name('sorb')
   .description('Sorb design token bridge')
-  .version('1.2.0')
+  .version(readPkgVersion())
 
 // ─── dev (default) ────────────────────────────────────────────────────────────
 
 program
   .command('dev', { isDefault: true })
   .description('Start the local token bridge server')
-  .option('-p, --port <port>', 'port to listen on', '7777')
+  .option('-p, --port <port>', 'port to listen on (overrides config)')
   .action(async (opts) => {
     const fileConfig = loadFileConfig()
 
     // 12-factor env config, then merge the on-disk sorb.config.json on top so
     // local mode keeps reading namespace/port from the file. With no hosted env
     // vars set, redisUrl/databaseUrl stay undefined → in-memory store, no DB.
+    //
+    // Port precedence: explicit --port flag > sorb.config.json > env/default.
+    // The flag has no default so an unpassed flag is `undefined` and yields to
+    // the config; passing -p always wins.
+    const cliPort =
+      opts.port !== undefined ? Number.parseInt(opts.port, 10) : undefined
     const envConfig = loadConfig()
     const config = {
       ...envConfig,
       namespace: fileConfig.namespace ?? envConfig.namespace,
-      port: fileConfig.port ?? parseInt(opts.port) ?? envConfig.port,
+      port: cliPort ?? fileConfig.port ?? envConfig.port,
     }
     const port = config.port
 
@@ -139,7 +159,7 @@ program
     // C2: bind the local bridge to 127.0.0.1 only (loopback), NOT 0.0.0.0
     // (all interfaces). @hono/node-server defaults to 0.0.0.0 when hostname is
     // omitted, which would expose the no-auth/open-CORS dev bridge to the LAN.
-    serve({ fetch: app.fetch, port, hostname: '127.0.0.1' }, () => {
+    const devServer = serve({ fetch: app.fetch, port, hostname: '127.0.0.1' }, () => {
       console.log(
         pc.dim('\n  Preview URL :') +
           pc.cyan(` http://127.0.0.1:${port}/preview`),
@@ -153,6 +173,23 @@ program
           pc.cyan(` http://127.0.0.1:${port}/health`),
       )
       console.log(pc.dim('\n  Watching for token file changes...\n'))
+    })
+
+    // A port clash otherwise surfaces as a raw unhandled EADDRINUSE stack
+    // trace. Catch it and print something the dev can act on.
+    devServer.on('error', async (err) => {
+      if (err && err.code === 'EADDRINUSE') {
+        console.error(
+          pc.red(`\n✗ Port ${port} in use`) +
+            pc.dim(' — pass ') +
+            pc.cyan('--port <n>') +
+            pc.dim(' or free it.\n'),
+        )
+        try { stop() } catch (e) { /* best-effort */ }
+        try { await store.close() } catch (e) { /* best-effort */ }
+        process.exit(1)
+      }
+      throw err
     })
 
     process.on('SIGINT', async () => {
@@ -276,10 +313,47 @@ program
   .option('--message <message>', 'PR / commit title', 'Update design tokens')
   .action(async (opts) => {
     const config = loadFileConfig()
-    const content = readFileSync(
-      resolve(process.cwd(), config.tokenPath),
-      'utf-8',
-    )
+
+    // Resolve token files from the SAME config shape the other commands use:
+    // `tokenSources` (what `sorb init` writes) with a legacy `tokenPath`
+    // fallback. Previously this only read `config.tokenPath`, so the config
+    // `init` writes crashed commit with a raw ERR_INVALID_ARG_TYPE.
+    const sources =
+      config.tokenSources ||
+      (config.tokenPath ? [config.tokenPath] : [])
+
+    if (sources.length === 0) {
+      console.error(
+        pc.red('\n✗ No token sources configured in sorb.config.json.\n'),
+      )
+      console.error(
+        pc.dim('  Add a ') +
+          pc.cyan('tokenSources') +
+          pc.dim(' array (or a legacy ') +
+          pc.cyan('tokenPath') +
+          pc.dim(') and try again.\n'),
+      )
+      process.exit(1)
+    }
+
+    const files = []
+    for (const rel of sources) {
+      const abs = resolve(process.cwd(), rel)
+      if (existsSync(abs)) files.push({ path: rel, content: readFileSync(abs, 'utf-8') })
+    }
+
+    if (files.length === 0) {
+      console.error(pc.red('\n✗ No token files found on disk.\n'))
+      console.error(
+        pc.dim('  Looked for: ') + sources.join(', ') + '\n',
+      )
+      console.error(
+        pc.dim('  Build/create your token sources, then run ') +
+          pc.cyan('sorb commit') +
+          pc.dim(' again.\n'),
+      )
+      process.exit(1)
+    }
 
     console.log(pc.dim('\n  Opening PR...'))
 
@@ -287,14 +361,13 @@ program
       const url = await openTokenPR({
         owner: opts.owner,
         repo: opts.repo,
-        tokenPath: config.tokenPath,
-        content,
+        files,
         message: opts.message,
         pat: opts.pat,
       })
       console.log(pc.green(`  ✓ PR opened: `) + pc.cyan(url) + '\n')
     } catch (err) {
-      console.error(pc.red('  ✗ Failed to open PR:'), err)
+      console.error(pc.red('  ✗ Failed to open PR: ') + (err && err.message ? err.message : String(err)) + '\n')
       process.exit(1)
     }
   })
