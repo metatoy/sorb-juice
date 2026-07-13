@@ -10,6 +10,7 @@ import { createDb } from './db/index'
 import { watchSources } from './watch'
 import { runStyleDictionary } from './transform'
 import { openTokenPR } from './github'
+import { createCloudReader, resolveCloudConfig, headUrl } from './cloud'
 import { initSentry, captureError, flushSentry } from './sentry'
 
 // ─── sorb.config.json loader ────────────────────────────────────────────────
@@ -44,8 +45,34 @@ program
   .command('dev', { isDefault: true })
   .description('Start the local token bridge server')
   .option('-p, --port <port>', 'port to listen on', '7777')
+  // ── cloud mode (north-star P3) — opt-in; local .sorb/ stays the free default ──
+  .option('--cloud', 'serve the resolved token map from sorb-cloud HEAD instead of local .sorb/resolved.json')
+  .option('--cloud-url <url>', 'sorb-cloud base URL (or env SORB_CLOUD_URL / CLOUD_API)')
+  .option('--cloud-set <id>', 'cloud token-set id to serve (or env SORB_CLOUD_SET)')
+  .option('--cloud-key <key>', 'API key for the cloud request (or env SORB_CLOUD_KEY)')
   .action(async (opts) => {
     const fileConfig = loadFileConfig()
+
+    // Cloud reader (north-star "cloud replaces the CLI", P3). Additive + opt-in:
+    // resolveCloudConfig returns null unless --cloud / SORB_CLOUD_URL is set, so
+    // the local path below is byte-for-byte unchanged when cloud mode is off.
+    let cloud = null
+    let cloudCfg = null
+    try {
+      cloudCfg = resolveCloudConfig(opts)
+      if (cloudCfg) {
+        cloud = createCloudReader({
+          ...cloudCfg,
+          // Surface transient cloud blips without crashing the bridge; the last
+          // good HEAD keeps serving.
+          onError: (err) =>
+            console.error(pc.yellow('  ⚠ cloud HEAD fetch failed: ') + (err && err.message ? err.message : String(err))),
+        })
+      }
+    } catch (e) {
+      console.error(pc.red('\n✗ ' + (e && e.message ? e.message : String(e)) + '\n'))
+      process.exit(1)
+    }
 
     // 12-factor env config, then merge the on-disk sorb.config.json on top so
     // local mode keeps reading namespace/port from the file. With no hosted env
@@ -65,7 +92,11 @@ program
 
     console.log(pc.bold('\nSorb'))
     console.log(pc.dim('  Namespace :') + ` ${config.namespace}`)
-    console.log(pc.dim('  Sources   :') + ` ${sources.join(', ') || '(none)'}`)
+    if (cloud) {
+      console.log(pc.dim('  Tokens    :') + ' cloud HEAD ' + pc.cyan(headUrl(cloudCfg.baseUrl, cloudCfg.setId)))
+    } else {
+      console.log(pc.dim('  Sources   :') + ` ${sources.join(', ') || '(none)'}`)
+    }
     console.log(pc.dim('  Port      :') + ` ${port}`)
 
     const sorbDir = resolve(process.cwd(), '.sorb')
@@ -77,6 +108,8 @@ program
       try { return JSON.parse(readFileSync(p, 'utf-8')) } catch (e) { return null }
     }
     const readResolvedArray = () => {
+      // Cloud mode: the resolved map is the cloud HEAD snapshot, not local disk.
+      if (cloud) return cloud.getResolvedTokens()
       const data = readJson(resolvedPath)
       return data && (Array.isArray(data) ? data : data.tokens)
     }
@@ -84,12 +117,18 @@ program
     const readIndex = () => readJson(indexPath)
 
     // Build tokens once up front, then on every source change, so the resolved
-    // map the plugin/seed consume is always fresh.
+    // map the plugin/seed consume is always fresh. In cloud mode there are no
+    // local sources to build or watch — the resolved map comes from cloud HEAD.
     const buildTokens = () => {
       if (fileConfig.styleDictionaryConfig) runStyleDictionary(fileConfig.styleDictionaryConfig)
     }
-    buildTokens()
-    const { stop } = watchSources(sources, buildTokens)
+    let stop = () => {}
+    if (cloud) {
+      cloud.start()
+    } else {
+      buildTokens()
+      ;({ stop } = watchSources(sources, buildTokens))
+    }
 
     // GET /tokens/latest — the committed token values the plugin prefills its
     // editor with. Prefer a legacy flat token file if present; otherwise derive
@@ -157,6 +196,7 @@ program
 
     process.on('SIGINT', async () => {
       stop()
+      if (cloud) cloud.stop()
       try { await store.close() } catch (e) { /* best-effort shutdown */ }
       if (db) {
         try { await db.close() } catch (e) { /* best-effort shutdown */ }
