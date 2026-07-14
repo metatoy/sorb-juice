@@ -11,6 +11,8 @@ import { watchSources } from './watch'
 import { runStyleDictionary } from './transform'
 import { openTokenPR } from './github'
 import { initSentry, captureError, flushSentry } from './sentry'
+import { execFileSync, spawnSync } from 'child_process'
+import { encodeHandshake, toHandshakeLink } from './handshake'
 
 // ─── sorb.config.json loader ────────────────────────────────────────────────
 // The on-disk project config (namespace, token sources, port). Kept separate
@@ -297,6 +299,13 @@ program
       ],
       styleDictionaryConfig: 'sd.config.js',
       port: 7777,
+      // Optional handshake-invite fields (blank-ok). `sorb handshake` reads these
+      // so it can run zero-flag on a configured repo; both are additive + back-
+      // compatible (existing configs without them still work). appUrl = the app
+      // page the preview opens; gh = the tokens-file GitHub edit URL (else derived
+      // from `git remote`).
+      appUrl: '',
+      gh: '',
     }
     writeFileSync(configPath, JSON.stringify(defaults, null, 2) + '\n')
     console.log(pc.green('  ✓ Created sorb.config.json'))
@@ -368,6 +377,130 @@ program
       console.log(pc.green(`  ✓ PR opened: `) + pc.cyan(url) + '\n')
     } catch (err) {
       console.error(pc.red('  ✗ Failed to open PR: ') + (err && err.message ? err.message : String(err)) + '\n')
+      process.exit(1)
+    }
+  })
+
+// ─── handshake ──────────────────────────────────────────────────────────────
+// Generate a shareable, self-contained invite that auto-configures a designer's
+// Figma plugin — no servers/URLs/keys for the designer to type. Assembles the
+// bundle from sorb.config.json (+ git remote for `gh`), base64url-encodes it,
+// and prints the sorb:// deep link + the raw paste code. See the canonical
+// format + signature in spec/sorb/gfp/part8-p0-design.md §2. The plugin's redeem
+// box accepts either the full link or the bare code.
+
+/**
+ * Derive a GitHub tokens-file edit URL from `git remote get-url origin`.
+ * Parses both SSH (git@github.com:owner/repo.git) and HTTPS remotes, strips a
+ * trailing .git, and points at the first token source on `main`. Returns '' when
+ * there is no origin remote or it isn't a github.com URL — `gh` blank is valid
+ * (the plugin treats it as "Open PR disabled").
+ * @param {string | undefined} tokenFile First token source (e.g. tokens/semantic.json).
+ * @returns {string}
+ */
+const deriveGhUrl = (tokenFile) => {
+  let raw
+  try {
+    raw = execFileSync('git', ['remote', 'get-url', 'origin'], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim()
+  } catch (e) {
+    return ''
+  }
+  if (!raw) return ''
+  // Normalize SSH + HTTPS forms to `owner/repo`.
+  let path = ''
+  const sshMatch = raw.match(/^git@github\.com:(.+?)(?:\.git)?$/)
+  const httpsMatch = raw.match(/^https?:\/\/github\.com\/(.+?)(?:\.git)?$/)
+  if (sshMatch) path = sshMatch[1]
+  else if (httpsMatch) path = httpsMatch[1]
+  else return ''
+  path = path.replace(/\/$/, '')
+  const file = tokenFile || 'tokens/semantic.json'
+  return `https://github.com/${path}/edit/main/${file}`
+}
+
+program
+  .command('handshake')
+  .description('Generate a shareable invite that auto-configures a designer\'s Figma plugin')
+  .option('--app <url>', 'App URL the preview opens (default: config.appUrl or http://localhost:5173)')
+  .option('--gh <url>', 'GitHub edit URL of the tokens file (default: config.gh or from git remote)')
+  .option('--pk <key>', 'Read-only sorb_pk_ for a hosted bridge (default: blank = keyless-local)')
+  .option('--origin <url>', 'Bridge origin override (default: http://127.0.0.1:<port from config>)')
+  .option('--exp <days>', 'Days until the invite expires (default: 30; pass 0 for no expiry)')
+  .option('--copy', 'Copy the paste code to the clipboard')
+  .option('--link-only', 'Print only the sorb:// link')
+  .option('--code-only', 'Print only the paste code')
+  .action((opts) => {
+    try {
+      const config = loadFileConfig()
+
+      // origin: --origin, else derived loopback from config.port (default 7777),
+      // matching what `sorb dev` binds/prints.
+      const port = config.port ?? 7777
+      const origin = opts.origin || `http://127.0.0.1:${port}`
+
+      // appUrl: --app > config.appUrl > default dev URL.
+      const appUrl = opts.app || config.appUrl || 'http://localhost:5173'
+
+      // gh: --gh > config.gh > derived from `git remote` > blank.
+      const tokenSources =
+        config.tokenSources || (config.tokenPath ? [config.tokenPath] : [])
+      const gh =
+        opts.gh || config.gh || deriveGhUrl(tokenSources[0]) || ''
+
+      // pk: --pk (from the cloud dashboard), else blank (keyless-local).
+      const pk = opts.pk || ''
+
+      // exp: now + --exp days (default 30). --exp 0 ⇒ omit (never expires).
+      const expDays = opts.exp !== undefined ? Number.parseInt(opts.exp, 10) : 30
+      const days = Number.isFinite(expDays) ? expDays : 30
+
+      // Assemble the payload in the canonical field order. Only include optional
+      // fields when meaningful so the blob stays minimal + matches the spec.
+      const payload = { v: 1, origin, appUrl, gh, pk }
+      if (config.namespace) payload.namespace = config.namespace
+      if (days > 0) payload.exp = Math.floor(Date.now() / 1000) + days * 86400
+
+      const code = encodeHandshake(payload)
+      const link = toHandshakeLink(code)
+
+      // --link-only / --code-only: raw single-string output for piping.
+      if (opts.linkOnly) {
+        console.log(link)
+        return
+      }
+      if (opts.codeOnly) {
+        console.log(code)
+      } else {
+        const kind = pk ? 'hosted' : 'keyless-local'
+        const expLabel = days > 0 ? `expires in ${days} day${days === 1 ? '' : 's'}` : 'no expiry'
+        console.log(pc.bold('\n  Sorb invite') + pc.dim(`  ·  ${kind}  ·  ${expLabel}\n`))
+        console.log(pc.dim('  Link  ') + pc.cyan(link))
+        console.log(pc.dim('  Code  ') + code)
+        console.log(
+          pc.dim('\n  → Send this to your designer. In the Sorb plugin they click') +
+            pc.dim('\n    "Paste an invite" and drop it in — no servers, URLs, or keys to set up.\n'),
+        )
+      }
+
+      // --copy: pipe the paste code to the macOS clipboard. Guarded — a missing
+      // pbcopy (non-mac / headless) must not fail the command.
+      if (opts.copy) {
+        try {
+          const r = spawnSync('pbcopy', { input: code })
+          if (r.status === 0) {
+            if (!opts.codeOnly) console.log(pc.green('  (copied to clipboard)\n'))
+          } else {
+            console.error(pc.yellow('  ⚠ Could not copy to clipboard (pbcopy unavailable).\n'))
+          }
+        } catch (e) {
+          console.error(pc.yellow('  ⚠ Could not copy to clipboard: ') + (e && e.message ? e.message : String(e)) + '\n')
+        }
+      }
+    } catch (e) {
+      console.error(pc.red('\n✗ Failed to build handshake: ') + (e && e.message ? e.message : String(e)) + '\n')
       process.exit(1)
     }
   })

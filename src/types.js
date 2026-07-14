@@ -26,6 +26,13 @@
  * @property {string} [styleDictionaryConfig]
  *   Optional path to style-dictionary config — runs build on startup + token change.
  * @property {number} [port] Port for the local server. Defaults to 7777.
+ * @property {string} [appUrl]
+ *   Optional. The running app page the preview opens (e.g. http://localhost:5173).
+ *   Read by `sorb handshake` to assemble an invite; blank/absent is fine. Additive,
+ *   back-compatible — configs without it still work.
+ * @property {string} [gh]
+ *   Optional. GitHub edit URL of the tokens file (the Open-PR target) baked into a
+ *   handshake invite. When absent, `sorb handshake` derives it from `git remote`.
  */
 
 /**
