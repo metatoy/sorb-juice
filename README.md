@@ -1,6 +1,6 @@
 # @sorb/juice
 
-Sorb bridge server + CLI (`sorb`) — carries proposed tokens from Figma into
+Sorb™ bridge server + CLI (`sorb`) — carries proposed tokens from Figma into
 your running app. (Juice: the conduit.)
 
 A dev dependency only — it never touches production.
@@ -85,3 +85,7 @@ sorb dev                        # bring the bridge up (/health, /tokens, /previe
 
 See the [main README](https://github.com/nhunsaker/sorb#readme) for the
 full workflow.
+
+---
+
+**Sorb™** is a trademark of Metatoy LLC.
