@@ -49,7 +49,7 @@ const readPkgVersion = () => {
 
 program
   .name('sorb')
-  .description('Sorb design token bridge')
+  .description('Sorb™ design token bridge')
   .version(readPkgVersion())
 
 // ─── dev (default) ────────────────────────────────────────────────────────────
@@ -83,7 +83,7 @@ program
     const sources =
       fileConfig.tokenSources || (fileConfig.tokenPath ? [fileConfig.tokenPath] : [])
 
-    console.log(pc.bold('\nSorb'))
+    console.log(pc.bold('\nSorb™'))
     console.log(pc.dim('  Namespace :') + ` ${config.namespace}`)
     console.log(pc.dim('  Sources   :') + ` ${sources.join(', ') || '(none)'}`)
     console.log(pc.dim('  Port      :') + ` ${port}`)
@@ -227,7 +227,7 @@ program
     const config = loadConfig()
     const port = config.port
 
-    console.log(pc.bold('\nSorb (hosted bridge)'))
+    console.log(pc.bold('\nSorb™ (hosted bridge)'))
     console.log(pc.dim('  Namespace :') + ` ${config.namespace}`)
     console.log(pc.dim('  Port      :') + ` ${port}`)
     console.log(pc.dim('  Redis     :') + ` ${config.redisUrl ? 'on' : 'off (in-memory)'}`)
