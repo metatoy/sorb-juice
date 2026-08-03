@@ -1,0 +1,30 @@
+name: pkg.pr.new preview
+
+# On every PR, build then publish an ephemeral package to pkg.pr.new. The bot
+# comments an install URL (npm i https://pkg.pr.new/@sorb/juice@<sha>) on the
+# PR — installable previews with zero npm-registry pollution.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write # so the pkg.pr.new bot can comment the install URL
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install
+        run: npm install
+
+      - name: Build
+        run: node build.mjs
+
+      - name: Publish preview
+        run: npx pkg-pr-new publish
