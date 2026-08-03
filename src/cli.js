@@ -9,6 +9,7 @@ import { createStore } from './store/index'
 import { createDb } from './db/index'
 import { watchSources } from './watch'
 import { runStyleDictionary } from './transform'
+import { runCheck, formatCheckText, EXIT } from './check'
 import { openTokenPR } from './github'
 import { initSentry, captureError, flushSentry } from './sentry'
 
@@ -370,6 +371,108 @@ program
       console.error(pc.red('  ✗ Failed to open PR: ') + (err && err.message ? err.message : String(err)) + '\n')
       process.exit(1)
     }
+  })
+
+// ─── check ────────────────────────────────────────────────────────────────────
+// Headless token-build check for CI. Re-runs the Style Dictionary build and diffs
+// the freshly-built snapshot for EVIDENCE of drift / binding-mismatch / off-role
+// bindings / deprecation, then exits non-zero so a CI check can fail the build.
+// The diff logic is the Sorb verify suite (src/verify/*); this command wires the
+// file I/O + SD rebuild around src/check.js's pure core. Reports what it measured
+// — it makes no compliance/outcome claim and promises no merge outcome.
+
+program
+  .command('check')
+  .description(
+    'Re-run the token build and report evidence of drift, binding-mismatch, or deprecation; exits non-zero on findings (for CI)',
+  )
+  .option('--resolved <path>', 'resolved token snapshot to check', '.sorb/resolved.json')
+  .option('--baseline <path>', 'previous resolved snapshot to diff against', '.sorb/baseline.json')
+  .option('--live <path>', 'live-captured cssVar→value map to diff the build against')
+  .option('--computed <path>', 'computed-styles map (property→value) for the hardcoded-value scan')
+  .option('--format <fmt>', 'output format: text | json', 'text')
+  .option('--no-build', 'skip the Style Dictionary rebuild; check the existing snapshot only')
+  .action(async (opts) => {
+    const fileConfig = loadFileConfig()
+
+    // Read a JSON file, returning null (not throwing) on absence/parse error so
+    // an optional input (baseline/live/computed) degrades to "skipped".
+    const readJsonFile = (rel) => {
+      const abs = resolve(process.cwd(), rel)
+      if (!existsSync(abs)) return null
+      try {
+        return JSON.parse(readFileSync(abs, 'utf-8'))
+      } catch (e) {
+        return null
+      }
+    }
+    // Coerce a parsed snapshot to the resolved-token array shape
+    // ([{cssVar,...}] or { tokens: [...] }).
+    const asArray = (data) =>
+      Array.isArray(data) ? data : data && Array.isArray(data.tokens) ? data.tokens : null
+
+    // 1) Re-run the Style Dictionary build (unless --no-build). A failed build is
+    //    itself a finding → non-zero exit.
+    // Diagnostics go to stderr so stdout carries only the report (clean JSON in
+    // --format json; the text block otherwise).
+    let buildOk = true
+    if (opts.build === false) {
+      console.error(pc.dim('  → Skipping Style Dictionary rebuild (--no-build)'))
+    } else if (fileConfig.styleDictionaryConfig) {
+      buildOk = runStyleDictionary(fileConfig.styleDictionaryConfig)
+    } else {
+      console.error(
+        pc.dim('  → No styleDictionaryConfig in sorb.config.json; checking the existing snapshot'),
+      )
+    }
+
+    // 2) Load the freshly-built resolved snapshot (required).
+    const resolved = asArray(readJsonFile(opts.resolved))
+    if (!resolved) {
+      console.error(
+        pc.red(`\n✗ No resolved token snapshot found at ${opts.resolved}.\n`),
+      )
+      console.error(
+        pc.dim('  Build your tokens first (') +
+          pc.cyan('sorb dev') +
+          pc.dim(' or your Style Dictionary build), then run ') +
+          pc.cyan('sorb check') +
+          pc.dim(' again.\n'),
+      )
+      process.exit(EXIT.USAGE)
+    }
+
+    // 3) Optional inputs.
+    const baseline = asArray(readJsonFile(opts.baseline))
+    const liveData = opts.live ? readJsonFile(opts.live) : undefined
+    const live =
+      liveData && !Array.isArray(liveData) && typeof liveData === 'object' ? liveData : null
+    const computedData = opts.computed ? readJsonFile(opts.computed) : null
+    const computedStyles =
+      computedData && typeof computedData === 'object' && !Array.isArray(computedData)
+        ? new Map(Object.entries(computedData))
+        : null
+
+    // 4) Run the pure check core.
+    const result = runCheck({
+      resolved,
+      baseline,
+      live: opts.live ? live : undefined,
+      computedStyles,
+      buildOk,
+    })
+
+    // 5) Report + set the exit code.
+    if (opts.format === 'json') {
+      console.log(JSON.stringify(result, null, 2))
+    } else {
+      // Plain text keeps CI logs clean; only the final ✓/✗ summary line is colored.
+      const lines = formatCheckText(result).split('\n')
+      const last = lines.pop()
+      console.log('\n' + lines.join('\n'))
+      console.log((result.ok ? pc.green(last) : pc.red(last)) + '\n')
+    }
+    process.exit(result.exitCode)
   })
 
 // ─── mcp ────────────────────────────────────────────────────────────────────

@@ -85,10 +85,10 @@ const freshDir = () => mkdtempSync(join(tmp, 'case-'))
 // ─── --help / --version ─────────────────────────────────────────────────────
 
 describe('sorb --help', () => {
-  it('exits 0 and lists all four commands', async () => {
+  it('exits 0 and lists the core commands', async () => {
     const { code, stdout } = await runCli(['--help'])
     assert.equal(code, 0)
-    for (const cmd of ['dev', 'serve', 'init', 'commit']) {
+    for (const cmd of ['dev', 'serve', 'init', 'commit', 'check']) {
       assert.ok(stdout.includes(cmd), `--help should mention '${cmd}'`)
     }
   })
@@ -203,6 +203,62 @@ describe('sorb serve', () => {
     } finally {
       await kill(child)
     }
+  })
+})
+
+// ─── check (E4 CI subcommand) ─────────────────────────────────────────────────
+
+describe('sorb check', () => {
+  const RESOLVED = [
+    { id: 'color.action.primary', cssVar: '--color-action-primary', value: '#0f65ef', tier: 'semantic', type: 'color' },
+    { id: 'radius.control', cssVar: '--radius-control', value: '4px', tier: 'semantic', type: 'dimension' },
+  ]
+
+  const setup = (cwd, { resolved = RESOLVED, baseline = RESOLVED } = {}) => {
+    writeFileSync(join(cwd, 'sorb.config.json'), JSON.stringify({ namespace: 'chk' }) + '\n')
+    mkdirSync(join(cwd, '.sorb'), { recursive: true })
+    if (resolved) writeFileSync(join(cwd, '.sorb', 'resolved.json'), JSON.stringify(resolved))
+    if (baseline) writeFileSync(join(cwd, '.sorb', 'baseline.json'), JSON.stringify(baseline))
+  }
+
+  it('exits 0 when the snapshot matches the baseline (--no-build)', async () => {
+    const cwd = freshDir()
+    setup(cwd)
+    const { code, stdout } = await runCli(['check', '--no-build'], { cwd })
+    assert.equal(code, 0, stdout)
+    assert.ok(/exit 0/.test(stdout), stdout)
+  })
+
+  it('exits 1 on drift and names the drifted token', async () => {
+    const cwd = freshDir()
+    const drifted = RESOLVED.map((t) =>
+      t.cssVar === '--color-action-primary' ? { ...t, value: '#0a5be0' } : t,
+    )
+    setup(cwd, { resolved: drifted })
+    const { code, stdout } = await runCli(['check', '--no-build'], { cwd })
+    assert.equal(code, 1, stdout)
+    assert.ok(/--color-action-primary/.test(stdout), stdout)
+    // Codex discipline: no outcome/enforcement wording in the CLI output.
+    assert.ok(!/complian|enforc|guarantee|warrant/i.test(stdout), stdout)
+  })
+
+  it('exits 2 when no resolved snapshot exists', async () => {
+    const cwd = freshDir()
+    setup(cwd, { resolved: null, baseline: null })
+    const { code, stderr } = await runCli(['check', '--no-build'], { cwd })
+    assert.equal(code, 2, stderr)
+    assert.ok(/No resolved token snapshot/i.test(stderr), stderr)
+  })
+
+  it('emits machine-readable JSON with --format json', async () => {
+    const cwd = freshDir()
+    setup(cwd)
+    const { code, stdout } = await runCli(['check', '--no-build', '--format', 'json'], { cwd })
+    assert.equal(code, 0, stdout)
+    const parsed = JSON.parse(stdout)
+    assert.equal(parsed.ok, true)
+    assert.equal(parsed.exitCode, 0)
+    assert.ok(parsed.counts && typeof parsed.counts.drift === 'number')
   })
 })
 
