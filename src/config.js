@@ -21,6 +21,7 @@
  *   PREVIEW_TTL_MS: number,
  *   PRUNE_INTERVAL_MS: number,
  *   NODE_ENV: string,
+ *   SORB_ENTERPRISE_FEED: undefined,
  * }}
  */
 export const DEFAULTS = Object.freeze({
@@ -32,6 +33,11 @@ export const DEFAULTS = Object.freeze({
   PREVIEW_TTL_MS: 86_400_000, // 24h — preserves today's preview/verify lifetime
   PRUNE_INTERVAL_MS: 3_600_000, // 1h — preserves today's in-memory prune cadence
   NODE_ENV: 'development',
+  // E5 continuous conformance-EVIDENCE feed: DARK by default. Unset ⇒ the feed
+  // surface is fully dormant (nothing recorded, no feed endpoint answers, no
+  // delivery). See src/enterprise/evidenceFeed.js for the three hard gates that
+  // must ALL clear before this is ever set on a deployed environment.
+  SORB_ENTERPRISE_FEED: undefined,
 })
 
 /**
@@ -92,6 +98,13 @@ export const loadConfig = (env = process.env) => {
   const redisUrl = strOrUndef(env.REDIS_URL)
   const databaseUrl = strOrUndef(env.DATABASE_URL)
 
+  // E5 dark-feed switch. Only the exact opt-in tokens flip it on; anything else
+  // (including unset) leaves the continuous conformance-EVIDENCE feed dormant.
+  const enterpriseFeedEnabled = ((v) =>
+    v === '1' || v === 'true' || v === 'on' || v === 'yes')(
+    String(env.SORB_ENTERPRISE_FEED ?? '').trim().toLowerCase(),
+  )
+
   /** @type {import('./types').Config} */
   const config = {
     port: intOr(env.PORT, DEFAULTS.PORT),
@@ -110,6 +123,11 @@ export const loadConfig = (env = process.env) => {
     redisEnabled: redisUrl !== undefined,
     databaseEnabled: databaseUrl !== undefined,
     hosted: redisUrl !== undefined || databaseUrl !== undefined,
+
+    // E5 (HELD/DARK): continuous conformance-EVIDENCE feed exposure. Default
+    // false ⇒ dormant. Gated by three hard human gates (E&O+Cyber · GA-ToS ·
+    // SOC 2) — never flip on a deployed env until all clear.
+    enterpriseFeedEnabled,
   }
 
   return Object.freeze(config)
