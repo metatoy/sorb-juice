@@ -1,0 +1,65 @@
+{
+  "report": "sorb-conformance-evidence",
+  "version": 1,
+  "title": "Sorb Conformance Evidence Report",
+  "description": "Descriptive conformance evidence: the tokens the running app resolves, checked against the tokens the design system declares.",
+  "scope": "WCAG 1.4.3 / 1.4.6 contrast only — not a full-site accessibility audit.",
+  "disclaimer": "This report is descriptive conformance evidence for the WCAG 1.4.3 / 1.4.6 contrast criteria over the token-governed slice of the named application. It is not a full accessibility audit and not a warranty or guarantee of WCAG compliance. Automated checks do not detect all accessibility issues.",
+  "app": "Acme Storefront",
+  "environment": "production",
+  "generatedAt": "2026-08-03T00:00:00Z",
+  "summary": {
+    "drifted": 3,
+    "missing": 1,
+    "extra": 1,
+    "divergences": 5,
+    "byTier": {
+      "semantic": {
+        "drifted": 1,
+        "missing": 1
+      },
+      "component": {
+        "drifted": 2,
+        "missing": 0
+      }
+    }
+  },
+  "findings": {
+    "drifted": [
+      {
+        "cssVar": "--color-text-primary",
+        "declared": "#222222",
+        "resolved": "#111111",
+        "tier": "semantic",
+        "type": "color"
+      },
+      {
+        "cssVar": "--button-primary-bg-default",
+        "declared": "#0f65ef",
+        "resolved": "#1a70ff",
+        "tier": "component",
+        "type": "color"
+      },
+      {
+        "cssVar": "--button-radius",
+        "declared": "4px",
+        "resolved": "6px",
+        "tier": "component",
+        "type": "dimension"
+      }
+    ],
+    "missing": [
+      {
+        "cssVar": "--radius-control",
+        "declared": "4px",
+        "tier": "semantic"
+      }
+    ],
+    "extra": [
+      {
+        "cssVar": "--shadow-elevated",
+        "resolved": "0 2px 8px rgba(0,0,0,0.15)"
+      }
+    ]
+  }
+}
