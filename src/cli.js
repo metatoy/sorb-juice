@@ -13,6 +13,7 @@ import { openTokenPR } from './github'
 import { initSentry, captureError, flushSentry } from './sentry'
 import { execFileSync, spawnSync } from 'child_process'
 import { encodeHandshake, toHandshakeLink } from './handshake'
+import { probeUrl } from './probe'
 
 // ─── sorb.config.json loader ────────────────────────────────────────────────
 // The on-disk project config (namespace, token sources, port). Kept separate
@@ -432,7 +433,7 @@ program
   .option('--copy', 'Copy the paste code to the clipboard')
   .option('--link-only', 'Print only the sorb:// link')
   .option('--code-only', 'Print only the paste code')
-  .action((opts) => {
+  .action(async (opts) => {
     try {
       const config = loadFileConfig()
 
@@ -441,8 +442,10 @@ program
       const port = config.port ?? 7777
       const origin = opts.origin || `http://127.0.0.1:${port}`
 
-      // appUrl: --app > config.appUrl > default dev URL.
+      // appUrl: --app > config.appUrl > default dev URL. Track the source so
+      // the invite output can say where it came from.
       const appUrl = opts.app || config.appUrl || 'http://localhost:5173'
+      const appUrlSource = opts.app ? '--app' : config.appUrl ? 'sorb.config.json' : 'default'
 
       // gh: --gh > config.gh > derived from `git remote` > blank.
       const tokenSources =
@@ -479,6 +482,20 @@ program
         console.log(pc.bold('\n  Sorb invite') + pc.dim(`  ·  ${kind}  ·  ${expLabel}\n`))
         console.log(pc.dim('  Link  ') + pc.cyan(link))
         console.log(pc.dim('  Code  ') + code)
+        console.log(pc.dim('  App   ') + appUrl + pc.dim(`  (from ${appUrlSource})`))
+
+        // Probe (inform, never substitute): a dead bridge or app is the #1 way
+        // an invite silently fails for the designer — say so now.
+        const [bridgeUp, appUp] = await Promise.all([
+          probeUrl(`${origin}/health`),
+          probeUrl(appUrl),
+        ])
+        if (!bridgeUp) {
+          console.error(pc.yellow(`\n  ⚠ No bridge at ${origin} — run \`sorb dev\` and leave it running before the designer connects.`))
+        }
+        if (!appUp) {
+          console.error(pc.yellow(`\n  ⚠ Your app at ${appUrl} isn't reachable — start it (e.g. \`npm run dev\`). Until it's up, the designer's preview falls back to the Sorb demo.`))
+        }
         console.log(
           pc.dim('\n  → Send this to your designer. In the Sorb plugin they click') +
             pc.dim('\n    "Paste an invite" and drop it in — no servers, URLs, or keys to set up.\n'),
