@@ -95,7 +95,7 @@ sorb dev                        # bring the bridge up (/health, /tokens, /previe
 # → load your app with ?preview=<id> to see a POSTed token override live, then revert
 ```
 
-See the [main README](https://github.com/nhunsaker/sorb#readme) for the
+See the [main README](https://github.com/metatoy/sorb-juice#readme) for the
 full workflow.
 
 ---
