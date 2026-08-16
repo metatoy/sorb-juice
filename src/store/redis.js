@@ -18,6 +18,8 @@ import Redis from 'ioredis'
 const PREVIEW_PREFIX = 'preview:'
 const VERIFY_PREFIX = 'verify:'
 const VERIFY_LATEST_KEY = 'verify:latest'
+// Single "latest" snapshot (no TTL, no history) — mirrors the memory store.
+const FIGMA_ARTIFACT_KEY = 'figma:artifact'
 
 const previewKey = (id) => PREVIEW_PREFIX + id
 const verifyKey = (id) => VERIFY_PREFIX + id
@@ -147,6 +149,23 @@ export const createRedisStore = async (config) => {
     return hasLatest ? Math.max(0, total - 1) : total
   }
 
+  // ─── FIGMA ARTIFACT ───────────────────────────────────────────────────────
+
+  /** @type {import('../types').Store['putFigmaArtifact']} */
+  const putFigmaArtifact = async (artifact) => {
+    // No PX: the export persists until the next one replaces it (unlike
+    // previews/verifications, this is a durable "latest known state", not a
+    // TTL'd ephemeral entry).
+    await client.set(FIGMA_ARTIFACT_KEY, JSON.stringify(artifact))
+  }
+
+  /** @type {import('../types').Store['getFigmaArtifact']} */
+  const getFigmaArtifact = async () => {
+    const raw = await client.get(FIGMA_ARTIFACT_KEY)
+    if (raw == null) return null
+    return JSON.parse(raw)
+  }
+
   // ─── LIFECYCLE / HEALTH ───────────────────────────────────────────────────
 
   /** @type {import('../types').Store['ping']} */
@@ -181,6 +200,8 @@ export const createRedisStore = async (config) => {
     getVerification,
     getLatestVerification,
     countVerifications,
+    putFigmaArtifact,
+    getFigmaArtifact,
     ping,
     close,
   }

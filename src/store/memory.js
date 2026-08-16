@@ -30,6 +30,12 @@ export const createMemoryStore = (config) => {
   /** @type {string | null} */
   let latestVerifyId = null
 
+  // Latest Figma Variables export posted by the plugin (POST /tokens/figma).
+  // Single "latest" snapshot, no TTL/history — same shape as a preview, but
+  // there's exactly one at a time (the most recent export replaces it).
+  /** @type {import('../types').FigmaArtifact | null} */
+  let figmaArtifact = null
+
   /** True once an entry's TTL has elapsed relative to now. */
   const isExpired = (entry, now) => now - entry.createdAt > ttlMs
 
@@ -134,6 +140,16 @@ export const createMemoryStore = (config) => {
     return n
   }
 
+  // ─── FIGMA ARTIFACT ───────────────────────────────────────────────────────
+
+  /** @type {import('../types').Store['putFigmaArtifact']} */
+  const putFigmaArtifact = async (artifact) => {
+    figmaArtifact = artifact
+  }
+
+  /** @type {import('../types').Store['getFigmaArtifact']} */
+  const getFigmaArtifact = async () => figmaArtifact
+
   // ─── LIFECYCLE / HEALTH ───────────────────────────────────────────────────
 
   /** @type {import('../types').Store['ping']} */
@@ -156,6 +172,8 @@ export const createMemoryStore = (config) => {
     getVerification,
     getLatestVerification,
     countVerifications,
+    putFigmaArtifact,
+    getFigmaArtifact,
     ping,
     close,
   }

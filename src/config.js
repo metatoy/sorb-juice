@@ -21,6 +21,7 @@
  *   PREVIEW_TTL_MS: number,
  *   PRUNE_INTERVAL_MS: number,
  *   NODE_ENV: string,
+ *   SORB_FIGMA_FILE_KEY: undefined,
  * }}
  */
 export const DEFAULTS = Object.freeze({
@@ -32,6 +33,11 @@ export const DEFAULTS = Object.freeze({
   PREVIEW_TTL_MS: 86_400_000, // 24h — preserves today's preview/verify lifetime
   PRUNE_INTERVAL_MS: 3_600_000, // 1h — preserves today's in-memory prune cadence
   NODE_ENV: 'development',
+  // Optional: the Figma file key this project's Variables live in. Purely
+  // informational — surfaced in GET /verify/figma as `configuredFileKey` so a
+  // dev can spot a stale/wrong-file export at a glance. Never enforced (the
+  // plugin may legitimately export from more than one file over time).
+  SORB_FIGMA_FILE_KEY: undefined,
 })
 
 /**
@@ -105,6 +111,7 @@ export const loadConfig = (env = process.env) => {
     previewTtlMs: intOr(env.PREVIEW_TTL_MS, DEFAULTS.PREVIEW_TTL_MS),
     pruneIntervalMs: intOr(env.PRUNE_INTERVAL_MS, DEFAULTS.PRUNE_INTERVAL_MS),
     nodeEnv: strOrUndef(env.NODE_ENV) ?? DEFAULTS.NODE_ENV,
+    figmaFileKey: strOrUndef(env.SORB_FIGMA_FILE_KEY),
 
     // Convenience flags so the store factory + /ready don't re-derive presence.
     redisEnabled: redisUrl !== undefined,

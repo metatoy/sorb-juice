@@ -46,6 +46,14 @@ tokens". It reads the `tokenSources` (or legacy `tokenPath`) from your
 
 - Serves the preview API the Figma plugin and your React app talk to:
   `POST/GET/PUT/DELETE /preview`, `GET /tokens/latest`, `GET /health`.
+- Serves the resolved bindable token map at `GET /tokens/resolved` and accepts
+  running-app self-reports at `POST /verify/app` for drift checking.
+- Accepts a Figma Variables export from the plugin at `POST /tokens/figma`
+  (read back via `GET /tokens/figma`) and diffs it against the resolved map at
+  `GET /verify/figma` — a Figma-vs-DTCG drift check. This only **flags**
+  drift; the DTCG token source is always truth, the Figma export is a mirror.
+  Set `SORB_FIGMA_FILE_KEY` to have the bridge echo back a `configuredFileKey`
+  in that response, useful for spotting an export taken from the wrong file.
 - Watches your source `tokens.json` and, if configured, re-runs Style
   Dictionary on every change.
 
@@ -61,6 +69,7 @@ Configure it with `sorb.config.json` (this is exactly what `sorb init` writes):
   ],
   "styleDictionaryConfig": "sd.config.js",
   "port": 7777,
+  "figmaFileKey": "abc123XYZ",
   "seed": { "storybookUrl": "http://localhost:6006" }
 }
 ```
@@ -68,6 +77,9 @@ Configure it with `sorb.config.json` (this is exactly what `sorb init` writes):
 > `tokenSources` (a DTCG set list) is the current shape; a single legacy
 > `tokenPath` string is still accepted as a fallback. `-p/--port` on the CLI
 > overrides `port` here. `seed.storybookUrl` is read by `sorb-seed capture`.
+> `figmaFileKey` is optional and informational only — echoed back by
+> `GET /verify/figma` as `configuredFileKey`; the `SORB_FIGMA_FILE_KEY` env var
+> takes precedence over it when both are set.
 
 ## Capture → dev → preview (the free loop)
 
