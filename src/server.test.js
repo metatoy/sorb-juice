@@ -874,3 +874,158 @@ describe('bridge POST /verify/app (running-app token verification)', () => {
     assert.equal(res.status, 400)
   })
 })
+
+// ─── /tokens/figma + /verify/figma — Figma reference pipeline (v0.5.0 P1) ────
+describe('bridge /tokens/figma + /verify/figma (Figma-vs-DTCG diff)', () => {
+  const RESOLVED = [
+    { id: 'color.action.primary', cssVar: '--color-action-primary', value: '#0f65ef', tier: 'semantic', type: 'color' },
+    { id: 'radius.control', cssVar: '--radius-control', value: '4px', tier: 'semantic', type: 'dimension' },
+    { id: 'button.primary.bg.default', cssVar: '--button-primary-bg-default', value: '#0f65ef', tier: 'component', type: 'color' },
+  ]
+
+  const makeResolvedApp = async (resolved, { figmaFileKey } = {}) => {
+    const config = { ...loadConfig(), figmaFileKey }
+    const store = await createMemoryStore(config)
+    openStores.push(store)
+    return createServer({
+      store,
+      config,
+      getLatestTokens: () => ({}),
+      getResolvedTokens: () => resolved,
+      getArtifactIndex: () => null,
+      getArtifact: () => null,
+    })
+  }
+
+  const figmaTokens = (overrides = {}) =>
+    RESOLVED.map((t) => ({ id: t.id, cssVar: t.cssVar, value: t.value, tier: t.tier, type: t.type, ...overrides[t.cssVar] }))
+
+  it('POST /tokens/figma stores the export; GET /tokens/figma reads it back', async () => {
+    const app = await makeResolvedApp(RESOLVED)
+    const tokens = figmaTokens()
+    const postRes = await app.request('/tokens/figma', jsonInit({ fileKey: 'abc123', exportedAt: '2026-08-15T00:00:00Z', tokens }))
+    assert.equal(postRes.status, 200)
+    const postBody = await postRes.json()
+    assert.deepEqual(postBody, { ok: true, count: tokens.length, fileKey: 'abc123' })
+
+    const getRes = await app.request('/tokens/figma')
+    assert.equal(getRes.status, 200)
+    const getBody = await getRes.json()
+    assert.equal(getBody.fileKey, 'abc123')
+    assert.equal(getBody.exportedAt, '2026-08-15T00:00:00Z')
+    assert.equal(getBody.tokens.length, tokens.length)
+    assert.equal(typeof getBody.receivedAt, 'number')
+  })
+
+  it('GET /tokens/figma → 404 before any export has been posted', async () => {
+    const app = await makeResolvedApp(RESOLVED)
+    const res = await app.request('/tokens/figma')
+    assert.equal(res.status, 404)
+  })
+
+  it('POST /tokens/figma missing/!array tokens → 400', async () => {
+    const app = await makeResolvedApp(RESOLVED)
+    assert.equal((await app.request('/tokens/figma', jsonInit({}))).status, 400)
+    assert.equal((await app.request('/tokens/figma', jsonInit({ tokens: {} }))).status, 400)
+  })
+
+  it('POST /tokens/figma invalid JSON body → 400', async () => {
+    const app = await makeResolvedApp(RESOLVED)
+    const res = await app.request('/tokens/figma', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{not json' })
+    assert.equal(res.status, 400)
+  })
+
+  it('exact match (no drift planted) → ok:true, zero mismatches/missing/extra', async () => {
+    const app = await makeResolvedApp(RESOLVED)
+    await app.request('/tokens/figma', jsonInit({ fileKey: null, tokens: figmaTokens() }))
+    const res = await app.request('/verify/figma')
+    assert.equal(res.status, 200)
+    const body = await res.json()
+    assert.equal(body.ok, true)
+    assert.equal(body.checked, RESOLVED.length)
+    assert.equal(body.matched, RESOLVED.length)
+    assert.deepEqual(body.mismatches, [])
+    assert.deepEqual(body.missingInFigma, [])
+    assert.deepEqual(body.extraInFigma, [])
+  })
+
+  it('planted drift: exactly ONE variable value mismatched → exactly that one mismatch, zero others', async () => {
+    const app = await makeResolvedApp(RESOLVED)
+    // Only --radius-control is wrong; everything else matches exactly.
+    await app.request(
+      '/tokens/figma',
+      jsonInit({ tokens: figmaTokens({ '--radius-control': { value: '8px' } }) }),
+    )
+    const res = await app.request('/verify/figma')
+    const body = await res.json()
+    assert.equal(body.ok, false)
+    assert.equal(body.checked, RESOLVED.length)
+    assert.equal(body.matched, RESOLVED.length - 1)
+    assert.deepEqual(body.mismatches, [{ cssVar: '--radius-control', tokens: '4px', figma: '8px' }])
+    assert.deepEqual(body.missingInFigma, [])
+    assert.deepEqual(body.extraInFigma, [])
+  })
+
+  it('format-insensitive match (#0F65EF == #0f65ef) does not count as a mismatch', async () => {
+    const app = await makeResolvedApp(RESOLVED)
+    await app.request(
+      '/tokens/figma',
+      jsonInit({ tokens: figmaTokens({ '--color-action-primary': { value: '  #0F65EF ' } }) }),
+    )
+    const res = await app.request('/verify/figma')
+    const body = await res.json()
+    assert.equal(body.ok, true)
+    assert.deepEqual(body.mismatches, [])
+  })
+
+  it('missing case: a resolved token absent from the Figma export → missingInFigma', async () => {
+    const app = await makeResolvedApp(RESOLVED)
+    const tokens = figmaTokens().filter((t) => t.cssVar !== '--radius-control')
+    await app.request('/tokens/figma', jsonInit({ tokens }))
+    const res = await app.request('/verify/figma')
+    const body = await res.json()
+    assert.deepEqual(body.missingInFigma, ['--radius-control'])
+    assert.equal(body.checked, RESOLVED.length)
+    assert.equal(body.matched, RESOLVED.length - 1)
+    assert.deepEqual(body.mismatches, [])
+  })
+
+  it('extra case: a Figma variable not present in the resolved map → extraInFigma', async () => {
+    const app = await makeResolvedApp(RESOLVED)
+    const tokens = [...figmaTokens(), { id: 'color.stray', cssVar: '--color-stray', value: '#000', tier: 'primitive', type: 'color' }]
+    await app.request('/tokens/figma', jsonInit({ tokens }))
+    const res = await app.request('/verify/figma')
+    const body = await res.json()
+    assert.deepEqual(body.extraInFigma, ['--color-stray'])
+    assert.equal(body.ok, true) // extras alone don't flip ok — see route comment
+  })
+
+  it('reports configuredFileKey from config.figmaFileKey when set', async () => {
+    const app = await makeResolvedApp(RESOLVED, { figmaFileKey: 'expected-file-key' })
+    await app.request('/tokens/figma', jsonInit({ fileKey: 'other-file-key', tokens: figmaTokens() }))
+    const res = await app.request('/verify/figma')
+    const body = await res.json()
+    assert.equal(body.fileKey, 'other-file-key')
+    assert.equal(body.configuredFileKey, 'expected-file-key')
+  })
+
+  it('no resolved map built → 404', async () => {
+    const app = await makeResolvedApp(null)
+    await app.request('/tokens/figma', jsonInit({ tokens: figmaTokens() }))
+    const res = await app.request('/verify/figma')
+    assert.equal(res.status, 404)
+  })
+
+  it('no Figma export posted yet → 404', async () => {
+    const app = await makeResolvedApp(RESOLVED)
+    const res = await app.request('/verify/figma')
+    assert.equal(res.status, 404)
+  })
+
+  it('POST /verify/app is unaffected by this route existing (regression)', async () => {
+    const app = await makeResolvedApp(RESOLVED)
+    const res = await app.request('/verify/app', jsonInit({ values: { '--radius-control': '4px' } }))
+    assert.equal(res.status, 200)
+    assert.equal((await res.json()).ok, true)
+  })
+})

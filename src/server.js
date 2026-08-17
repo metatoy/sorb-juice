@@ -472,6 +472,68 @@ export const createServer = ({
     return c.json(entry)
   })
 
+  // ─── GET /verify/figma ──────────────────────────────────────────────────────
+  // FIGMA-vs-DTCG drift check: diffs the latest Figma Variables export (POST
+  // /tokens/figma) against the committed resolved map (GET /tokens/resolved),
+  // matched by cssVar. This route only FLAGS drift — it never resolves it: the
+  // DTCG token source is truth, the Figma export is a mirror. Compares
+  // format-insensitively (lowercase + collapse whitespace), same as
+  // POST /verify/app. `ok` mirrors /verify/app's contract (mismatches-only);
+  // missingInFigma/extraInFigma are reported but don't themselves flip `ok`,
+  // since a partial/in-progress export is a normal transient state.
+  // MUST be registered before /verify/:id or Hono treats "figma" as :id.
+  app.get('/verify/figma', async (c) => {
+    const resolved = getResolvedTokens()
+    if (!resolved) {
+      return c.json(
+        { error: 'No resolved token map. Run `sorb-seed resolve` (Style Dictionary build).' },
+        404,
+      )
+    }
+    const artifact = await store.getFigmaArtifact()
+    if (!artifact) {
+      return c.json(
+        { error: 'No Figma export yet. Run "Export variables" in the Sorb plugin.' },
+        404,
+      )
+    }
+
+    // Every entry here is expected to already carry a cssVar (both the SD build
+    // and the plugin exporter produce one); the id-derived fallback only
+    // protects against a malformed/partial artifact.
+    const cssVarOf = (t) => t.cssVar || '--' + String(t.id || '').split('.').join('-')
+    const want = new Map(resolved.map((t) => [cssVarOf(t), t.value]))
+    const got = new Map(artifact.tokens.map((t) => [cssVarOf(t), t.value]))
+
+    const norm = (v) => String(v == null ? '' : v).trim().toLowerCase().replace(/\s+/g, ' ')
+
+    const mismatches = []
+    const missingInFigma = []
+    let matched = 0
+    for (const [cssVar, expected] of want) {
+      if (!got.has(cssVar)) {
+        missingInFigma.push(cssVar)
+        continue
+      }
+      const figmaValue = got.get(cssVar)
+      if (norm(expected) === norm(figmaValue)) matched++
+      else mismatches.push({ cssVar, tokens: expected, figma: figmaValue })
+    }
+    const extraInFigma = [...got.keys()].filter((cssVar) => !want.has(cssVar))
+    const checked = want.size
+
+    return c.json({
+      ok: mismatches.length === 0 && checked > 0,
+      checked,
+      matched,
+      mismatches,
+      missingInFigma,
+      extraInFigma,
+      fileKey: artifact.fileKey ?? null,
+      configuredFileKey: config.figmaFileKey ?? null,
+    })
+  })
+
   // ─── GET /verify/:id ──────────────────────────────────────────────────────
   // A specific verification by id.
   app.get('/verify/:id', async (c) => {
@@ -560,6 +622,55 @@ export const createServer = ({
       unknown,
     })
   })
+
+  // ─── POST /tokens/figma ────────────────────────────────────────────────────
+  // The Figma plugin (sorb-canopy "Export variables" action) POSTs its exported
+  // Variables here as a resolved-map artifact:
+  //   { fileKey: string|null, exportedAt: string|null, tokens: [{id,cssVar,value,tier,type}] }
+  // Stored as the single latest Figma-side snapshot (no history) — GET
+  // /tokens/figma and GET /verify/figma read it back. WRITE op, same gate as
+  // /preview and /verify.
+  app.post('/tokens/figma', async (c) => {
+    if (hosted) {
+      const denied = requireWrite(c)
+      if (denied) return denied
+    }
+    let body
+    try {
+      body = await c.req.json()
+    } catch (e) {
+      return c.json({ error: 'Invalid JSON body' }, 400)
+    }
+    const tokens = body && body.tokens
+    if (!Array.isArray(tokens)) {
+      return c.json({ error: 'Missing { tokens: [...] } array' }, 400)
+    }
+    const artifact = {
+      fileKey: body.fileKey ?? null,
+      exportedAt: body.exportedAt ?? null,
+      tokens,
+      receivedAt: Date.now(),
+    }
+    await store.putFigmaArtifact(artifact)
+    return c.json({ ok: true, count: tokens.length, fileKey: artifact.fileKey })
+  })
+
+  // ─── GET /tokens/figma ──────────────────────────────────────────────────────
+  // The latest Figma Variables export, as posted by the plugin. 404 until the
+  // plugin has exported at least once.
+  app.get('/tokens/figma', async (c) => {
+    const artifact = await store.getFigmaArtifact()
+    if (!artifact) {
+      return c.json(
+        { error: 'No Figma export yet. Run "Export variables" in the Sorb plugin.' },
+        404,
+      )
+    }
+    return c.json(artifact)
+  })
+
+  // GET /verify/figma lives above, registered before /verify/:id (Hono route
+  // ordering — see that route's comment).
 
   // ─── GET /artifacts ───────────────────────────────────────────────────────
   // The captured-component index — list of components/stories with hashes,

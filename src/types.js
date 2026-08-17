@@ -33,6 +33,10 @@
  * @property {string} [gh]
  *   Optional. GitHub edit URL of the tokens file (the Open-PR target) baked into a
  *   handshake invite. When absent, `sorb handshake` derives it from `git remote`.
+ * @property {string} [figmaFileKey]
+ *   Optional. The Figma file key this project's Variables live in. Informational
+ *   only — surfaced by GET /verify/figma as `configuredFileKey`, never enforced.
+ *   The SORB_FIGMA_FILE_KEY env var takes precedence when both are set.
  */
 
 /**
@@ -52,6 +56,9 @@
  *   localhost/127.0.0.1 + Figma allowlist). Used by the P0.3b CSRF guard.
  * @property {number} previewTtlMs TTL for previews + verifications, in ms.
  * @property {number} pruneIntervalMs In-memory prune interval, in ms.
+ * @property {string | undefined} figmaFileKey Optional Figma file key
+ *   (SORB_FIGMA_FILE_KEY) this project's Variables live in. Informational
+ *   only — surfaced by GET /verify/figma, never enforced.
  */
 
 /**
@@ -62,6 +69,28 @@
  * @property {object} bbox
  * @property {object} meta
  * @property {number} createdAt
+ */
+
+/**
+ * A single Figma-exported token, matching @sorb/core's ResolvedToken shape
+ * (the same one returned by GET /tokens/resolved).
+ * @typedef {Object} FigmaExportedToken
+ * @property {string} id Dotted token id (e.g. "color.action.primary").
+ * @property {string} cssVar CSS custom-property name (e.g. "--color-action-primary").
+ * @property {string} value
+ * @property {string} [tier] "primitive" | "semantic" | "component", when known.
+ * @property {string} type
+ */
+
+/**
+ * The latest Figma Variables export POSTed by the plugin (sorb-canopy) via
+ * POST /tokens/figma. Stored as a single "latest" snapshot per store instance
+ * (no history) — same persistence pattern as previews/verifications above.
+ * @typedef {Object} FigmaArtifact
+ * @property {string | null} fileKey Figma file key the export was taken from, or null.
+ * @property {string | null} exportedAt ISO timestamp the plugin recorded at export time, or null.
+ * @property {FigmaExportedToken[]} tokens
+ * @property {number} receivedAt Server-side receipt timestamp (Date.now()) — juice's own bookkeeping.
  */
 
 /**
@@ -79,6 +108,8 @@
  * @property {(id: string) => Promise<VerificationEntry | null>} getVerification
  * @property {() => Promise<VerificationEntry | null>} getLatestVerification
  * @property {() => Promise<number>} countVerifications
+ * @property {(artifact: FigmaArtifact) => Promise<void>} putFigmaArtifact
+ * @property {() => Promise<FigmaArtifact | null>} getFigmaArtifact
  * @property {() => Promise<boolean>} ping
  * @property {() => Promise<void>} close
  */

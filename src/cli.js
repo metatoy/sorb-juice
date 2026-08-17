@@ -78,6 +78,9 @@ program
       ...envConfig,
       namespace: fileConfig.namespace ?? envConfig.namespace,
       port: cliPort ?? fileConfig.port ?? envConfig.port,
+      // Optional Figma file key (informational — surfaced by GET /verify/figma
+      // as `configuredFileKey`). SORB_FIGMA_FILE_KEY env wins if both are set.
+      figmaFileKey: envConfig.figmaFileKey ?? fileConfig.figmaFileKey,
     }
     const port = config.port
 
