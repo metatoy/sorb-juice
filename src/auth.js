@@ -39,6 +39,9 @@ export const SCOPE = Object.freeze({ READ: 'read', WRITE: 'write' })
  * @property {string} namespace projects.namespace.
  * @property {string[]} allowedOrigins projects.allowed_origins (text[]); [] if null.
  * @property {'read' | 'write'} scope Derived from `type`.
+ * @property {'dev' | 'stage' | 'prod'} environment The key's environment
+ *   (api_keys.environment). Defaults to 'prod' for legacy keys minted before the
+ *   per-environment column existed. See src/apiKeys.js for the env model.
  */
 
 /**
@@ -100,7 +103,7 @@ export async function resolveApiKey(db, authHeader) {
   const hash = hashKey(raw)
 
   const result = await db.query(
-    `SELECT k.id AS key_id, k.type, k.project_id, p.org_id, p.namespace, p.allowed_origins
+    `SELECT k.id AS key_id, k.type, k.environment, k.project_id, p.org_id, p.namespace, p.allowed_origins
        FROM api_keys k
        JOIN projects p ON p.id = k.project_id
       WHERE k.hash = $1 AND k.revoked_at IS NULL
@@ -115,6 +118,12 @@ export async function resolveApiKey(db, authHeader) {
   const type = row.type
   const scope = type === 'publishable' ? SCOPE.READ : SCOPE.WRITE
   const allowedOrigins = Array.isArray(row.allowed_origins) ? row.allowed_origins : []
+  // Legacy keys (minted before migration 003) carry no environment → 'prod',
+  // matching the column's backfill default so behavior is unchanged for them.
+  const environment =
+    row.environment === 'dev' || row.environment === 'stage' || row.environment === 'prod'
+      ? row.environment
+      : 'prod'
 
   return Object.freeze({
     keyId: row.key_id,
@@ -123,6 +132,7 @@ export async function resolveApiKey(db, authHeader) {
     orgId: row.org_id,
     namespace: row.namespace,
     allowedOrigins,
-    scope
+    scope,
+    environment
   })
 }

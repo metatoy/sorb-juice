@@ -3,6 +3,17 @@ import { cors } from 'hono/cors'
 import { nanoid } from 'nanoid'
 import { resolveApiKey, SCOPE } from './auth.js'
 import { getEntitlements, effectiveEntitlements, FREE } from './entitlements.js'
+import {
+  isFeedEnabled,
+  composeAppCheckEvent,
+  composeTelemetryEvent,
+  composeSignalEvent,
+  recordEvidenceEvent,
+  listEvidenceEvents,
+  FEED_KIND,
+  FEED_FRAMING,
+  FEED_DISCLAIMER,
+} from './enterprise/evidenceFeed.js'
 
 /**
  * Build the Hono bridge app. All preview/verify state lives in the injected
@@ -71,6 +82,14 @@ export const createServer = ({
   // The ONE switch. Everything new lives behind `hosted`; when it is false the
   // server is byte-for-byte the free local bridge it has always been.
   const hosted = Boolean(config.databaseUrl)
+
+  // E5 (HELD/DARK): the continuous conformance-EVIDENCE feed. DEFAULT OFF. When
+  // false — the only supported state today — nothing is recorded to
+  // evidence_events and the feed endpoint answers 404 (dormant). Requires hosted
+  // mode too (evidence rows are tenant-scoped). Three human hard gates
+  // (E&O+Cyber · GA-ToS · SOC 2) must ALL clear before this is set on a deployed
+  // environment. See src/enterprise/evidenceFeed.js.
+  const feedOn = hosted && isFeedEnabled(config)
 
   // Where to send a user who hits a paid gate (402). Relative '/billing' by
   // default; overridable for the hosted control-plane host.
@@ -450,6 +469,11 @@ export const createServer = ({
   // Plugin posts the post-layout geometry of an inserted component so the
   // canvas can be reconciled against the captured artifact. Returns a short id.
   // WRITE op.
+  //
+  // In hosted mode: a best-effort INSERT into verify_events is written after
+  // the store write so the beta can measure weekly active verify runs per
+  // project (moat-proof retention metric R-0607-16). Like preview bookkeeping,
+  // a failed insert does not fail the request.
   app.post('/verify', async (c) => {
     if (hosted) {
       const denied = requireWrite(c)
@@ -458,6 +482,44 @@ export const createServer = ({
     const { storyId, bbox, meta } = await c.req.json()
     const id = nanoid(8)
     await store.putVerification(id, { storyId, bbox, meta })
+
+    if (hosted) {
+      const ctx = c.get('auth')
+      const boundFields = (meta && typeof meta.boundFields === 'number') ? meta.boundFields : null
+      try {
+        await db.query(
+          'INSERT INTO verify_events (project_id, story_id, bound_fields) VALUES ($1, $2, $3)',
+          [ctx.projectId, storyId ?? null, boundFields],
+        )
+        // E5 (DARK): compose this telemetry row into the conformance-evidence
+        // stream — ONLY when the feed flag is on. Default off ⇒ this never runs
+        // and no evidence row is written. Best-effort; never fails the request.
+        if (feedOn) {
+          await recordEvidenceEvent(
+            db,
+            ctx.projectId,
+            composeTelemetryEvent({ storyId, boundFields, environment: ctx.environment }),
+            onError,
+          )
+        }
+      } catch (e) {
+        // Best-effort: the verify is already recorded in the store. A failed
+        // insert only affects telemetry; do not fail the request.
+        onError(e, { at: 'verify.telemetry.insert', id })
+        // E5 (DARK): capture the operational signal onto the evidence stream —
+        // the Sentry leg. Only when the feed is on; carries a coarse tag, no
+        // error detail. Best-effort within the catch.
+        if (feedOn) {
+          await recordEvidenceEvent(
+            db,
+            ctx.projectId,
+            composeSignalEvent({ at: 'verify.telemetry.insert', environment: ctx.environment }),
+            onError,
+          )
+        }
+      }
+    }
+
     return c.json({ id })
   })
 
@@ -614,12 +676,65 @@ export const createServer = ({
       else mismatches.push({ cssVar, expected, got })
     }
     const checked = matched + mismatches.length
-    return c.json({
+    const result = {
       ok: mismatches.length === 0 && checked > 0,
       checked,
       matched,
       mismatches,
       unknown,
+    }
+
+    // E5 (DARK): compose this running-app check into the conformance-evidence
+    // stream — ONLY when the feed flag is on AND in hosted mode (evidence rows
+    // are tenant-scoped). Default off ⇒ this never runs and no evidence row is
+    // written. Records COUNTS only (no token names/values). Best-effort.
+    if (feedOn) {
+      const ctx = c.get('auth')
+      if (ctx && ctx.projectId) {
+        await recordEvidenceEvent(
+          db,
+          ctx.projectId,
+          composeAppCheckEvent({ result, environment: ctx.environment }),
+          onError,
+        )
+      }
+    }
+
+    return c.json(result)
+  })
+
+  // ─── GET /enterprise/evidence/feed ─────────────────────────────────────────
+  // E5 (HELD/DARK): the continuous conformance-EVIDENCE feed READ path. Returns
+  // the tenant's recent descriptive evidence events (running-app checks, verify
+  // telemetry, captured signals) across environments.
+  //
+  // DORMANT BY DEFAULT: unless `feedOn` (hosted mode AND SORB_ENTERPRISE_FEED
+  // explicitly enabled), this answers 404 — indistinguishable from a route that
+  // does not exist. The customer-facing feed does NOT exist on any deployed
+  // environment: the three E5 hard gates (E&O+Cyber · GA-ToS · SOC 2) must ALL
+  // clear before the flag is ever set. The auth middleware still gates this
+  // route in hosted mode (a Bearer key is required), so even when enabled it is
+  // tenant-scoped, never public.
+  app.get('/enterprise/evidence/feed', async (c) => {
+    if (!feedOn) {
+      // Dark: reveal nothing. Same shape a non-existent route would 404 with.
+      return c.json({ error: 'Not found' }, 404)
+    }
+    const ctx = c.get('auth')
+    if (!ctx || !ctx.projectId) {
+      return c.json({ error: 'Not found' }, 404)
+    }
+    const envFilter = c.req.query('environment')
+    const events = await listEvidenceEvents(
+      db,
+      { projectId: ctx.projectId, environment: envFilter || undefined },
+      onError,
+    )
+    return c.json({
+      kind: FEED_KIND,
+      framing: FEED_FRAMING,
+      disclaimer: FEED_DISCLAIMER,
+      events,
     })
   })
 

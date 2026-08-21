@@ -1,0 +1,24 @@
+{
+  "_note": "Golden-file fixture input for the E2 conformance-evidence renderer. `declared` + `resolved` feed diffConformance(); the renderers produce conformance-report.{html,json,md}. Keys are intentionally out of tier/alpha order to prove the renderer sorts deterministically.",
+  "meta": {
+    "app": "Acme Storefront",
+    "environment": "production",
+    "generatedAt": "2026-08-03T00:00:00Z"
+  },
+  "declared": {
+    "--button-primary-bg-default": { "value": "#0f65ef", "tier": "component", "type": "color" },
+    "--color-action-primary": { "value": "#0f65ef", "tier": "semantic", "type": "color" },
+    "--color-text-primary": { "value": "#222222", "tier": "semantic", "type": "color" },
+    "--color-blue-500": { "value": "#0f65ef", "tier": "primitive", "type": "color" },
+    "--radius-control": { "value": "4px", "tier": "semantic", "type": "dimension" },
+    "--button-radius": { "value": "4px", "tier": "component", "type": "dimension" }
+  },
+  "resolved": {
+    "--button-primary-bg-default": "#1a70ff",
+    "--color-action-primary": "#0f65ef",
+    "--color-text-primary": "#111111",
+    "--color-blue-500": "#0f65ef",
+    "--button-radius": "6px",
+    "--shadow-elevated": "0 2px 8px rgba(0,0,0,0.15)"
+  }
+}

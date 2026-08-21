@@ -163,6 +163,8 @@ const PUBLISHABLE_HASH_B = hashKey(PUBLISHABLE_KEY_B)
  * @param {boolean} [opts.throwOnCount] make the active-preview count throw.
  * @param {boolean} [opts.throwOnOwnership] make the `SELECT 1 FROM previews`
  *   ownership check throw (tenant-gate DB outage on GET/PUT/DELETE).
+ * @param {boolean} [opts.throwOnVerifyTelemetry] make the verify_events INSERT
+ *   throw — tests that best-effort telemetry failure does not fail the request.
  * @param {string[]} [opts.allowedOrigins] projects.allowed_origins.
  */
 const makeFakeDb = (opts = {}) => {
@@ -173,14 +175,18 @@ const makeFakeDb = (opts = {}) => {
     throwOnEntitlements = false,
     throwOnCount = false,
     throwOnOwnership = false,
+    throwOnVerifyTelemetry = false,
     allowedOrigins = [],
   } = opts
   // Map<previewId, owningProjectId> — every preview's true tenant owner.
   const ownedPreviews = new Map()
+  // Array of {projectId, storyId, boundFields} from verify_events INSERTs.
+  const verifyEvents = []
   // Every query() invocation, for spying (e.g. "no ownership query was made").
   const calls = []
   return {
     ownedPreviews,
+    verifyEvents,
     calls,
     async ping() {
       return true
@@ -281,6 +287,13 @@ const makeFakeDb = (opts = {}) => {
         const id = params[0]
         const proj = params[1]
         if (ownedPreviews.get(id) === proj) ownedPreviews.delete(id)
+        return { rows: [] }
+      }
+      // ── verify telemetry INSERT (best-effort; throwOnVerifyTelemetry tests
+      //    that a failure here does not fail the /verify request itself) ──
+      if (text.startsWith('INSERT INTO verify_events')) {
+        if (throwOnVerifyTelemetry) throw new Error('verify_events insert failed')
+        verifyEvents.push({ projectId: params[0], storyId: params[1], boundFields: params[2] })
         return { rows: [] }
       }
       return { rows: [] }
@@ -666,6 +679,69 @@ describe('hosted mode — cross-tenant isolation', () => {
         text.includes('count(*)') && text.includes('FROM previews') && params[0] === PROJECT_B,
     )
     assert.equal(countCallForB, true)
+  })
+})
+
+// ─── HOSTED MODE — verify telemetry (R-0607-16 moat-proof instrumentation) ──
+// POST /verify in hosted mode writes a best-effort verify_events row so the
+// beta can measure weekly active verify runs per project. A DB failure on the
+// telemetry INSERT must NOT fail the request (best-effort, like preview bookkeeping).
+describe('hosted mode — verify telemetry', () => {
+  const VERIFY_PAYLOAD = {
+    storyId: 'kit-button--primary',
+    bbox: { width: 82, height: 38, x: 0, y: 0 },
+    meta: { boundFields: 3 },
+  }
+
+  it('POST /verify inserts a verify_events row with correct project_id and storyId', async () => {
+    const { app, db } = await makeHostedApp()
+    const res = await app.request('/verify', jsonAuth(VERIFY_PAYLOAD, SECRET_KEY))
+    assert.equal(res.status, 200)
+    assert.equal(db.verifyEvents.length, 1)
+    assert.equal(db.verifyEvents[0].projectId, PROJECT_A)
+    assert.equal(db.verifyEvents[0].storyId, 'kit-button--primary')
+    assert.equal(db.verifyEvents[0].boundFields, 3)
+  })
+
+  it('POST /verify still returns 200 when the telemetry INSERT throws (best-effort)', async () => {
+    const { app, db } = await makeHostedApp({ throwOnVerifyTelemetry: true })
+    const res = await app.request('/verify', jsonAuth(VERIFY_PAYLOAD, SECRET_KEY))
+    assert.equal(res.status, 200)
+    const body = await res.json()
+    assert.equal(typeof body.id, 'string')
+    // No verify_events row recorded (insert threw before push).
+    assert.equal(db.verifyEvents.length, 0)
+  })
+
+  it('POST /verify with null meta records null boundFields', async () => {
+    const { app, db } = await makeHostedApp()
+    const res = await app.request(
+      '/verify',
+      jsonAuth({ storyId: 'kit-icon', bbox: { width: 24, height: 24 } }, SECRET_KEY),
+    )
+    assert.equal(res.status, 200)
+    assert.equal(db.verifyEvents.length, 1)
+    assert.equal(db.verifyEvents[0].boundFields, null)
+  })
+
+  it('POST /verify does NOT write to verify_events in local (non-hosted) mode', async () => {
+    // makeApp() creates a local (no DATABASE_URL) server — the db is null.
+    const app = await makeApp()
+    const res = await app.request(
+      '/verify',
+      jsonInit({ storyId: 'kit-button--primary', bbox: { width: 82, height: 38 } }),
+    )
+    assert.equal(res.status, 200)
+    // No db in local mode — just checking the request succeeds without touching db.
+    const body = await res.json()
+    assert.equal(typeof body.id, 'string')
+  })
+
+  it('POST /verify requires write scope in hosted mode (publishable key → 403)', async () => {
+    const { app } = await makeHostedApp()
+    const res = await app.request('/verify', jsonAuth(VERIFY_PAYLOAD, PUBLISHABLE_KEY))
+    assert.equal(res.status, 403)
+    assert.equal((await res.json()).code, 'read_only')
   })
 })
 
