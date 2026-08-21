@@ -112,6 +112,176 @@ describe('verify 404 before any report', () => {
   })
 })
 
+// ─── BINDING GRAPH ROUTES (roadmap §7 copy/paste theming) ────────────────────
+// /usages, /blast, /graft/plan — built lazily over injected accessors. The
+// fixture mirrors the real sorb-demo .sorb/ shapes (frame fill/stroke/
+// cornerRadius + child TEXT fill) plus a Danger variant for graft.
+
+const GRAPH_RESOLVED = [
+  { id: 'color.blue.500', cssVar: '--color-blue-500', value: '#0f65ef', tier: 'primitive', type: 'color' },
+  { id: 'color.action.primary', cssVar: '--color-action-primary', value: '#0f65ef', tier: 'semantic', type: 'color' },
+  { id: 'button.primary.bg.default', cssVar: '--button-primary-bg-default', value: '#0f65ef', tier: 'component', type: 'color' },
+  { id: 'button.primary.border.default', cssVar: '--button-primary-border-default', value: '#0f65ef', tier: 'component', type: 'color' },
+  { id: 'button.primary.text.default', cssVar: '--button-primary-text-default', value: '#ffffff', tier: 'component', type: 'color' },
+  { id: 'button.radius', cssVar: '--button-radius', value: '4px', tier: 'component', type: 'dimension' },
+  { id: 'button.danger.bg.default', cssVar: '--button-danger-bg-default', value: '#ee3322', tier: 'component', type: 'color' },
+  { id: 'button.danger.border.default', cssVar: '--button-danger-border-default', value: '#ee3322', tier: 'component', type: 'color' },
+  { id: 'button.danger.text.default', cssVar: '--button-danger-text-default', value: '#ffffff', tier: 'component', type: 'color' },
+]
+
+const PRIMARY_ART = {
+  stories: [{
+    id: 'components-button--primary', name: 'Primary', component: 'Button',
+    root: {
+      type: 'FRAME', name: 'Button',
+      sorb: { tokens: { fill: 'button.primary.bg.default', stroke: 'button.primary.border.default', cornerRadius: 'button.radius' } },
+      children: [{ type: 'TEXT', name: 'label', sorb: { tokens: { fill: 'button.primary.text.default' } } }],
+    },
+  }],
+}
+
+const DANGER_ART = {
+  stories: [{
+    id: 'components-button--danger', name: 'Danger', component: 'Button',
+    root: {
+      type: 'FRAME', name: 'Button',
+      sorb: { tokens: { fill: 'button.danger.bg.default', stroke: 'button.danger.border.default' } },
+      children: [{ type: 'TEXT', name: 'label', sorb: { tokens: { fill: 'button.danger.text.default' } } }],
+    },
+  }],
+}
+
+const GRAPH_INDEX = {
+  version: 1,
+  stories: {
+    'components-button--primary': { component: 'Button', name: 'Primary', importPath: 'Button.sorb.json', artifact: '.sorb/Button.sorb.json' },
+    'components-button--danger': { component: 'Button', name: 'Danger', importPath: 'Danger.sorb.json', artifact: '.sorb/Danger.sorb.json' },
+  },
+}
+
+const ARTIFACTS_BY_STORY = {
+  'components-button--primary': PRIMARY_ART,
+  'components-button--danger': DANGER_ART,
+}
+
+const makeGraphApp = async () => {
+  const config = loadConfig()
+  const store = await createMemoryStore(config)
+  openStores.push(store)
+  return createServer({
+    store,
+    config,
+    getResolvedTokens: () => GRAPH_RESOLVED,
+    getArtifactIndex: () => GRAPH_INDEX,
+    getArtifact: (storyId) => ARTIFACTS_BY_STORY[storyId] || null,
+  })
+}
+
+describe('GET /usages (P1)', () => {
+  it('?id= returns { id, cssVar, count, components:[{storyId, role}] }', async () => {
+    const app = await makeGraphApp()
+    const res = await app.request('/usages?id=button.primary.bg.default')
+    assert.equal(res.status, 200)
+    const body = await res.json()
+    assert.equal(body.id, 'button.primary.bg.default')
+    assert.equal(body.cssVar, '--button-primary-bg-default')
+    assert.equal(body.count, 1)
+    assert.deepEqual(body.components, [{ storyId: 'components-button--primary', role: 'fill' }])
+  })
+
+  it('?cssVar= resolves to token id(s) and returns every component rendering it', async () => {
+    const app = await makeGraphApp()
+    const res = await app.request('/usages?cssVar=--button-primary-bg-default')
+    assert.equal(res.status, 200)
+    const body = await res.json()
+    assert.equal(body.cssVar, '--button-primary-bg-default')
+    assert.equal(body.id, 'button.primary.bg.default')
+    assert.equal(body.count, 1)
+    assert.deepEqual(body.components, [{ storyId: 'components-button--primary', role: 'fill' }])
+  })
+
+  it('unknown token → count 0, components [] (not 404)', async () => {
+    const app = await makeGraphApp()
+    const res = await app.request('/usages?id=does.not.exist')
+    assert.equal(res.status, 200)
+    const body = await res.json()
+    assert.equal(body.count, 0)
+    assert.deepEqual(body.components, [])
+  })
+
+  it('400 when neither id nor cssVar is provided', async () => {
+    const app = await makeGraphApp()
+    const res = await app.request('/usages')
+    assert.equal(res.status, 400)
+  })
+
+  it('400 when both id and cssVar are provided', async () => {
+    const app = await makeGraphApp()
+    const res = await app.request('/usages?id=x&cssVar=--y')
+    assert.equal(res.status, 400)
+  })
+})
+
+describe('GET /blast (P2)', () => {
+  it('primitive blast expands the alias chain to component-bound surfaces', async () => {
+    const app = await makeGraphApp()
+    const res = await app.request('/blast?id=color.blue.500')
+    assert.equal(res.status, 200)
+    const body = await res.json()
+    // bg + border on Primary alias #0f65ef → 2 affected (story,role) pairs
+    assert.equal(body.count, 2)
+    assert.ok(body.aliasGroup.includes('color.action.primary'))
+    assert.ok(body.aliasGroup.includes('button.primary.bg.default'))
+  })
+
+  it('400 when ?id= is missing', async () => {
+    const app = await makeGraphApp()
+    const res = await app.request('/blast')
+    assert.equal(res.status, 400)
+  })
+})
+
+describe('POST /graft/plan (P3)', () => {
+  const post = (body) => ({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+
+  it('Primary → Danger pairs shared roles and conflicts the rest', async () => {
+    const app = await makeGraphApp()
+    const res = await app.request('/graft/plan', post({ from: 'components-button--primary', to: 'components-button--danger' }))
+    assert.equal(res.status, 200)
+    const body = await res.json()
+    assert.equal(body.from, 'components-button--primary')
+    assert.equal(body.to, 'components-button--danger')
+    const byRole = Object.fromEntries(body.changeset.map((x) => [x.role, x]))
+    assert.equal(byRole.stroke.sourceTokenId, 'button.primary.border.default')
+    assert.equal(byRole.stroke.targetTokenId, 'button.danger.border.default')
+    assert.ok(byRole.fill)
+    // cornerRadius is on source but not target → conflict, never dropped
+    const cr = body.conflicts.find((x) => x.role === 'cornerRadius')
+    assert.equal(cr.reason, 'no_target_role')
+  })
+
+  it('roles filter restricts the graft', async () => {
+    const app = await makeGraphApp()
+    const res = await app.request('/graft/plan', post({ from: 'components-button--primary', to: 'components-button--danger', roles: ['stroke'] }))
+    const body = await res.json()
+    assert.equal(body.changeset.length, 1)
+    assert.equal(body.changeset[0].role, 'stroke')
+    assert.equal(body.conflicts.length, 0)
+  })
+
+  it('400 on missing from/to', async () => {
+    const app = await makeGraphApp()
+    const res = await app.request('/graft/plan', post({ from: 'components-button--primary' }))
+    assert.equal(res.status, 400)
+  })
+
+  it('404 on unknown source/target story', async () => {
+    const app = await makeGraphApp()
+    const res = await app.request('/graft/plan', post({ from: 'nope', to: 'components-button--danger' }))
+    assert.equal(res.status, 404)
+  })
+})
+
 // ─── HOSTED MODE ─────────────────────────────────────────────────────────────
 // config.databaseUrl set ⇒ auth + entitlements enforced. We never touch a real
 // Postgres: a FAKE db routes on SQL text and returns canned api_keys/projects/

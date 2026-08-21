@@ -115,6 +115,20 @@
  */
 
 /**
+ * The in-memory binding-graph index built by buildBindingGraph (src/graph/index.js).
+ * READ/COMPUTE only — never mutates source. Lazily built + cached in server.js.
+ * @typedef {Object} BindingGraph
+ * @property {Map<string, {id:string,cssVar:string,value:string|number,tier:string,type:string}>} tokenById
+ *   tokenId → ResolvedToken (the resolved bindable token).
+ * @property {Map<string, string[]>} idsByCssVar
+ *   cssVar → token id(s) that emit it (normally 1:1; union defensively).
+ * @property {Map<string, Array<{storyId:string, role:string}>>} usagesByToken
+ *   tokenId → the (story, role) bindings that render it (the reverse edge set).
+ * @property {Map<string, {storyId:string, component:string|undefined, name:string|undefined, bindings:Array<{role:string, tokenId:string}>}>} stories
+ *   storyId → flattened bindings across that story's whole LayerNode tree.
+ */
+
+/**
  * The Postgres durable layer returned by createDb (src/db/index.js), or null in
  * local mode when DATABASE_URL is unset.
  * @typedef {Object} DbHandle

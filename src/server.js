@@ -14,6 +14,7 @@ import {
   FEED_FRAMING,
   FEED_DISCLAIMER,
 } from './enterprise/evidenceFeed.js'
+import { buildBindingGraph, usagesOf, idsForCssVar, blastRadius, graftPlan } from './graph/index.js'
 
 /**
  * Build the Hono bridge app. All preview/verify state lives in the injected
@@ -100,6 +101,45 @@ export const createServer = ({
   const previewTtlMs = config.previewTtlMs || 86_400_000
 
   const app = new Hono()
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // Binding graph (roadmap §7 copy/paste theming) — lazy-built + cached.
+  // READ/COMPUTE only: this index never mutates source, tokens, or main.
+  //
+  // Lazy-with-cache (spec default for the spike): the graph is built on first
+  // /usages|/graft request from the existing accessors and reused thereafter.
+  // The cache key is the identity of the resolved array + the artifact index
+  // object, so a watchSources rebuild (which swaps those refs) transparently
+  // invalidates us without wiring an explicit watcher.
+  // ───────────────────────────────────────────────────────────────────────────
+  let graphCache = null // { keyResolved, keyIndex, graph }
+
+  const getBindingGraph = () => {
+    const resolved = getResolvedTokens()
+    const index = getArtifactIndex()
+    if (graphCache && graphCache.keyResolved === resolved && graphCache.keyIndex === index) {
+      return graphCache.graph
+    }
+    // Gather every story artifact via the index (id → artifact). getArtifact
+    // returns the whole *.sorb.json (may carry multiple stories); buildBindingGraph
+    // walks each artifact's stories[].root. Dedupe artifact files so a multi-story
+    // file is only walked once.
+    const artifacts = []
+    const seen = new Set()
+    const stories = (index && index.stories) || {}
+    for (const storyId of Object.keys(stories)) {
+      const art = getArtifact(storyId)
+      if (!art) continue
+      // Identity-dedupe: getArtifact may return the same object for sibling
+      // stories sharing one file.
+      if (seen.has(art)) continue
+      seen.add(art)
+      artifacts.push(art)
+    }
+    const graph = buildBindingGraph(resolved, artifacts)
+    graphCache = { keyResolved: resolved, keyIndex: index, graph }
+    return graph
+  }
 
   // ───────────────────────────────────────────────────────────────────────────
   // HOSTED middleware (registered ONLY when a database is configured)
@@ -809,6 +849,97 @@ export const createServer = ({
     const art = getArtifact(storyId)
     if (!art) return c.json({ error: 'Artifact not found for id: ' + storyId }, 404)
     return c.json(art)
+  })
+
+  // ─── GET /usages?id=<tokenId> | ?cssVar=<var> ─────────────────────────────
+  // Reverse query over the binding graph: which captured components/roles render
+  // a token. READ-ONLY blast radius (roadmap §7 P1). 400 on missing/both params.
+  // An unknown token returns count:0 + components:[] (NOT a 404 — "rendered
+  // nowhere" is a valid answer).
+  //
+  // Response (pinned): { id, cssVar, count, components: [{storyId, role}] }
+  //   - ?id=  → id is the queried token id, cssVar resolved from the map.
+  //   - ?cssVar= → id is the resolved token id (first match), cssVar echoes the
+  //     queried var; when a cssVar maps to multiple ids the components UNION and
+  //     count reflects the union.
+  app.get('/usages', (c) => {
+    const id = c.req.query('id')
+    const cssVar = c.req.query('cssVar')
+    if ((id && cssVar) || (!id && !cssVar)) {
+      return c.json({ error: 'Provide exactly one of ?id= or ?cssVar=' }, 400)
+    }
+    const graph = getBindingGraph()
+
+    if (id) {
+      return c.json(usagesOf(graph, id))
+    }
+
+    // ?cssVar= — resolve to token id(s), then union their usages.
+    const ids = idsForCssVar(graph, cssVar)
+    /** @type {Map<string, {storyId:string, role:string}>} */
+    const union = new Map()
+    for (const tid of ids) {
+      for (const u of usagesOf(graph, tid).components) {
+        union.set(u.storyId + ' ' + u.role, u)
+      }
+    }
+    const components = Array.from(union.values())
+    return c.json({
+      id: ids.length ? ids[0] : null,
+      cssVar,
+      count: components.length,
+      components,
+    })
+  })
+
+  // ─── GET /blast?id=<tokenId> ──────────────────────────────────────────────
+  // Like /usages but expands the alias chain: editing a primitive reports the
+  // semantic/component tokens that alias it (same resolved value+type) AND their
+  // bound components. READ-ONLY (roadmap §7 P2).
+  // Response (pinned): { id, aliasGroup:[tokenId], count, components:[{storyId, role, via}] }
+  app.get('/blast', (c) => {
+    const id = c.req.query('id')
+    if (!id) return c.json({ error: 'Missing ?id=' }, 400)
+    const graph = getBindingGraph()
+    return c.json(blastRadius(graph, id))
+  })
+
+  // ─── POST /graft/plan ─────────────────────────────────────────────────────
+  // Plan a theme graft from one component onto another, reconciled BY ROLE
+  // (same role key; tie-break by TIER_RANK). COMPUTE-ONLY: returns a changeset +
+  // conflict list, never writes (apply is canopy P4 via /preview).
+  //
+  // Body: { from, to, roles? }  (from/to = storyId)
+  // Response (pinned):
+  //   { from, to,
+  //     changeset: [{role, sourceTokenId, targetTokenId}],
+  //     conflicts: [{role, reason}] }
+  // A target role with no compatible token, or a type mismatch (e.g. color onto
+  // a dimension role), appears in `conflicts` — never silently dropped.
+  app.post('/graft/plan', async (c) => {
+    let body
+    try {
+      body = await c.req.json()
+    } catch (e) {
+      return c.json({ error: 'Invalid JSON body' }, 400)
+    }
+    const from = body && body.from
+    const to = body && body.to
+    const roles = body && body.roles
+    if (typeof from !== 'string' || typeof to !== 'string') {
+      return c.json({ error: 'Body requires string `from` and `to` (story ids)' }, 400)
+    }
+    if (roles !== undefined && !Array.isArray(roles)) {
+      return c.json({ error: '`roles` must be an array of role keys when present' }, 400)
+    }
+    const graph = getBindingGraph()
+    if (!graph.stories.has(from)) {
+      return c.json({ error: 'Unknown source story id: ' + from }, 404)
+    }
+    if (!graph.stories.has(to)) {
+      return c.json({ error: 'Unknown target story id: ' + to }, 404)
+    }
+    return c.json(graftPlan(graph, from, to, roles))
   })
 
   // ─── GET /health ──────────────────────────────────────────────────────────
