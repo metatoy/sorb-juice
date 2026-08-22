@@ -29,35 +29,30 @@ ALTER TABLE previews ADD COLUMN IF NOT EXISTS chain_id uuid;
 -- Mirrors the Envelope + per-type payload in sensor-events.schema.json:
 --   envelope fields are real columns; type-specific fields live in `payload`
 --   (jsonb), same pattern as evidence_events.payload.
+-- RECONCILED to sorb-cloud's canonical migration 010_sensor_events.sql
+-- (cloud owns the schema; its src/lib/sensorEvents.ts + tests are built to this
+-- exact shape). Both files use CREATE TABLE IF NOT EXISTS with an IDENTICAL
+-- column set so they are order-independent on the shared Postgres — whichever
+-- of cloud's migrate.ts / juice's migrate.js runs first, the table is the same.
+-- (runtime_outcome is RESERVED — sensor.js never writes it. consent MUST be
+-- true past the hot path: sensor.js's isConsented() gate runs BEFORE this
+-- insert. Never raw DOM/screenshots in payload — see sensor-spine.md.)
 CREATE TABLE IF NOT EXISTS sensor_events (
-  id              uuid PRIMARY KEY,                    -- = Envelope.event_id, minted by sensor.js
   schema_version  integer NOT NULL DEFAULT 1,
+  event_id        uuid PRIMARY KEY,
   chain_id        uuid NOT NULL,
   org_id          uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
   app_id          uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  -- proposal | verify_result | accept_reject | runtime_outcome | conformance_snapshot_ref
-  -- (runtime_outcome is RESERVED — sensor.js never writes it; see sensor-spine.md
-  -- "runtime_outcome — genuinely undesigned").
+  mode            text NOT NULL CHECK (mode IN ('A', 'B', 'C')),
+  consent         boolean NOT NULL,
+  ts              timestamptz NOT NULL,
+  actor_role      text NOT NULL
+                    CHECK (actor_role IN ('owner', 'admin', 'editor', 'viewer', 'system')),
   type            text NOT NULL
                     CHECK (type IN ('proposal', 'verify_result', 'accept_reject', 'runtime_outcome', 'conformance_snapshot_ref')),
-  mode            text NOT NULL DEFAULT 'A' CHECK (mode IN ('A', 'B', 'C')),
-  -- MUST be true for the row to exist past the hot path — sensor.js's
-  -- isConsented() gate runs BEFORE this insert, so every row here already
-  -- passed consent; the column is kept so the envelope contract is complete
-  -- and auditable (never trust a caller-supplied consent=true alone).
-  consent         boolean NOT NULL DEFAULT false,
-  actor_role      text NOT NULL DEFAULT 'system'
-                    CHECK (actor_role IN ('owner', 'admin', 'editor', 'viewer', 'system')),
-  -- Type-specific fields (tokens/preview_id/story_id for proposal; check/ok/
-  -- checked/matched/mismatch_count for verify_result; outcome/signal/
-  -- token_commit_id for accept_reject; snapshot_id/storage_ref for
-  -- conformance_snapshot_ref). Never raw DOM/screenshots — see sensor-spine.md
-  -- Exclusions.
-  payload         jsonb NOT NULL DEFAULT '{}'::jsonb,
-  occurred_at     timestamptz NOT NULL DEFAULT now()
+  payload         jsonb NOT NULL,
+  received_at     timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS sensor_events_app_id_idx     ON sensor_events(app_id);
 CREATE INDEX IF NOT EXISTS sensor_events_chain_id_idx   ON sensor_events(chain_id);
-CREATE INDEX IF NOT EXISTS sensor_events_type_idx       ON sensor_events(type);
-CREATE INDEX IF NOT EXISTS sensor_events_occurred_at_idx ON sensor_events(occurred_at);
+CREATE INDEX IF NOT EXISTS sensor_events_org_id_ts_idx  ON sensor_events(org_id, ts);

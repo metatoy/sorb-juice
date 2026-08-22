@@ -165,7 +165,7 @@ async function insertEvent(db, event, payload, onError) {
   try {
     await db.query(
       `INSERT INTO sensor_events
-         (id, schema_version, chain_id, org_id, app_id, type, mode, consent, actor_role, payload, occurred_at)
+         (event_id, schema_version, chain_id, org_id, app_id, type, mode, consent, actor_role, payload, ts)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
       [
         event.event_id,
