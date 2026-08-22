@@ -16,6 +16,14 @@ import {
   FEED_DISCLAIMER,
 } from './enterprise/evidenceFeed.js'
 import { buildBindingGraph, usagesOf, idsForCssVar, blastRadius, graftPlan } from './graph/index.js'
+import {
+  mintChainId,
+  lookupChainId,
+  recordProposal,
+  recordVerifyResult,
+  recordAcceptReject,
+  recordConformanceSnapshotRef,
+} from './sensor.js'
 
 /**
  * Build the Hono bridge app. All preview/verify state lives in the injected
@@ -116,6 +124,14 @@ export const createServer = ({
     const cutoff = Date.now() - ACTIVITY_TTL_MS
     return entries.filter((e) => Date.parse(e.verifiedAt) > cutoff).slice(-ACTIVITY_MAX)
   }
+
+  // E2 (sensor spine) — preview ids that were explicitly DELETEd, so the
+  // terminal store.onUpdate('delete') listener registered in POST /preview
+  // (below) can tell "designer discarded it" (explicit_discard) apart from
+  // "it just aged out" (ttl_expiry). Marked in DELETE /preview/:id BEFORE the
+  // store write, consumed (and removed) the moment the listener fires. Only
+  // ever populated in hosted mode.
+  const explicitDiscards = new Set()
 
   const app = new Hono()
 
@@ -507,12 +523,18 @@ export const createServer = ({
       const ttlMs = ent.previewPersistence ? null : previewTtlMs
       await store.putPreview(id, tokens, ttlMs)
 
+      // E2 (sensor spine): mint the chain_id that threads proposal ->
+      // verify_result -> accept_reject for this preview's whole cycle. Minted
+      // HERE (not in sensor.js's insert path) so it can be persisted alongside
+      // the preview bookkeeping row below and looked up later by id.
+      const chainId = mintChainId()
+
       // Bookkeeping row for the per-project count + TTL (juice owns previews).
       const expiresAt = ttlMs == null ? null : new Date(Date.now() + ttlMs)
       try {
         await db.query(
-          'INSERT INTO previews (id, project_id, expires_at) VALUES ($1, $2, $3)',
-          [id, ctx.projectId, expiresAt],
+          'INSERT INTO previews (id, project_id, expires_at, chain_id) VALUES ($1, $2, $3, $4)',
+          [id, ctx.projectId, expiresAt, chainId],
         )
       } catch (e) {
         // Best-effort bookkeeping: the preview is already in the store. A failed
@@ -520,6 +542,33 @@ export const createServer = ({
         // it so silent bookkeeping drift is observable.
         onError(e, { at: 'preview.bookkeeping.insert', id })
       }
+
+      // E2 (sensor spine): emit `proposal` — best-effort, never blocks the
+      // response. isConsented() is checked inside recordProposal(); when the
+      // org hasn't consented this is a silent no-op.
+      recordProposal(db, { chainId, orgId: ctx.orgId, appId: ctx.projectId, previewId: id, tokens }, onError).catch(
+        (e) => onError(e, { at: 'sensor.proposal', id }),
+      )
+
+      // E2 (sensor spine): `accept_reject` is inferred, not explicit — there is
+      // no dedicated route. Subscribe to this ONE preview's terminal delete so
+      // whichever happens first (DELETE /preview/:id or TTL-expiry) emits a
+      // `rejected` event with the right `signal`. Unsubscribes itself the
+      // moment it fires (bounded lifetime = this preview's lifetime, itself
+      // bounded by entitlements.maxActivePreviews). 'accepted' /
+      // 'explicit_commit' is NOT wired here — see recordAcceptReject's doc
+      // comment: no route in this repo writes token_commits today.
+      const unsubscribeTerminal = store.onUpdate(id, (evt) => {
+        if (evt.type !== 'delete') return
+        unsubscribeTerminal()
+        const signal = explicitDiscards.has(id) ? 'explicit_discard' : 'ttl_expiry'
+        explicitDiscards.delete(id)
+        recordAcceptReject(
+          db,
+          { chainId, orgId: ctx.orgId, appId: ctx.projectId, previewId: id, outcome: 'rejected', signal },
+          onError,
+        ).catch((e) => onError(e, { at: 'sensor.acceptReject', id }))
+      })
 
       const url = `?preview=${id}`
       return c.json({ id, url })
@@ -619,6 +668,11 @@ export const createServer = ({
       if (!owned) {
         return c.json({ error: 'Preview not found' }, 404)
       }
+      // E2 (sensor spine): mark BEFORE the store write so the terminal
+      // store.onUpdate('delete') listener (registered in POST /preview) sees
+      // this as an explicit discard rather than a TTL-expiry — see server.js's
+      // `explicitDiscards` comment.
+      explicitDiscards.add(id)
       await store.deletePreview(id)
       try {
         await db.query('DELETE FROM previews WHERE id = $1 AND project_id = $2', [id, ctx.projectId])
@@ -647,7 +701,11 @@ export const createServer = ({
       const denied = requireWrite(c)
       if (denied) return denied
     }
-    const { storyId, bbox, meta } = await c.req.json()
+    // `previewId` (E2, sensor spine): OPTIONAL, additive field — existing
+    // callers that omit it are unaffected. When present (and in hosted mode)
+    // it correlates this verify_result back to the proposal's chain_id via
+    // previews.chain_id (see sensor.js lookupChainId).
+    const { storyId, bbox, meta, previewId } = await c.req.json()
     const id = nanoid(8)
     await store.putVerification(id, { storyId, bbox, meta })
 
@@ -684,6 +742,48 @@ export const createServer = ({
             composeSignalEvent({ at: 'verify.telemetry.insert', environment: ctx.environment }),
             onError,
           )
+        }
+      }
+
+      // E2 (sensor spine): `verify_result` (check: 'figma_geometry'). Only
+      // emitted when the caller passed `previewId` (correlation is required —
+      // see sensor-events.schema.json Envelope.chain_id) and it resolves to a
+      // chain_id. Best-effort; never blocks the response.
+      //
+      // ASSUMPTION (flagged, not silently papered over): POST /verify has NO
+      // real comparison logic today — it just stores the plugin's self-reported
+      // {bbox, meta}, it never diffs against an expected geometry. There is
+      // therefore no real ok/checked/matched to report for this check. Until a
+      // real figma_geometry diff lands (that's a separate, larger feature),
+      // this reports a PROXY: `ok: true`, `checked`/`matched` = boundFields (a
+      // self-report count, not a verified match count), `mismatch_count: 0`.
+      // This is a documented gap, not a designed metric — the alternative
+      // (schema requires ok/checked/matched to be present) would be to skip
+      // this check type entirely, which seemed worse than a clearly-flagged
+      // proxy. Revisit once GET /verify/figma's real diff logic (or an
+      // equivalent) is available at this call site.
+      if (previewId) {
+        try {
+          const chainId = await lookupChainId(db, previewId, ctx.projectId)
+          if (chainId) {
+            const proxyCount = Number.isFinite(boundFields) ? boundFields : 0
+            recordVerifyResult(
+              db,
+              {
+                chainId,
+                orgId: ctx.orgId,
+                appId: ctx.projectId,
+                check: 'figma_geometry',
+                ok: true,
+                checked: proxyCount,
+                matched: proxyCount,
+                mismatchCount: 0,
+              },
+              onError,
+            ).catch((e) => onError(e, { at: 'sensor.verifyResult', id }))
+          }
+        } catch (e) {
+          onError(e, { at: 'sensor.verifyResult.lookup', id })
         }
       }
     }
@@ -893,6 +993,40 @@ export const createServer = ({
       }
     }
 
+    // E2 (sensor spine): `verify_result` (check: 'app_values') — this route DOES
+    // compute real ok/checked/matched (unlike POST /verify above), so the counts
+    // here are genuine, not a proxy. `previewId` is an OPTIONAL, additive field
+    // on the body (existing callers that omit `values`-only bodies still work);
+    // without it there is no chain_id to correlate against, so nothing is
+    // emitted. Best-effort; never blocks the response.
+    if (hosted) {
+      const ctx = c.get('auth')
+      const previewId = body && body.previewId
+      if (ctx && ctx.projectId && previewId) {
+        try {
+          const chainId = await lookupChainId(db, previewId, ctx.projectId)
+          if (chainId) {
+            recordVerifyResult(
+              db,
+              {
+                chainId,
+                orgId: ctx.orgId,
+                appId: ctx.projectId,
+                check: 'app_values',
+                ok: result.ok,
+                checked: result.checked,
+                matched: result.matched,
+                mismatchCount: result.mismatches.length,
+              },
+              onError,
+            ).catch((e) => onError(e, { at: 'sensor.verifyResult' }))
+          }
+        } catch (e) {
+          onError(e, { at: 'sensor.verifyResult.lookup' })
+        }
+      }
+    }
+
     return c.json(result)
   })
 
@@ -960,6 +1094,35 @@ export const createServer = ({
       receivedAt: Date.now(),
     }
     await store.putFigmaArtifact(artifact)
+
+    // E2 (sensor spine): `conformance_snapshot_ref` — a POINTER only
+    // (storage_ref), never the snapshot payload itself (sensor-spine.md
+    // Exclusions: the actual `tokens` array never rides this event). Not part
+    // of any proposal->verify->accept cycle, so there is no preview to
+    // correlate against — mints its own standalone chain_id (documented
+    // assumption; the schema requires a chain_id on every event and this is
+    // the only event type with no natural chain to join). Best-effort; never
+    // blocks the response.
+    if (hosted) {
+      const ctx = c.get('auth')
+      if (ctx && ctx.projectId) {
+        recordConformanceSnapshotRef(
+          db,
+          {
+            chainId: mintChainId(),
+            orgId: ctx.orgId,
+            appId: ctx.projectId,
+            snapshotId: nanoid(8),
+            // Pointer into juice's own Figma-artifact store (single latest
+            // snapshot per project today — see putFigmaArtifact above), never
+            // the DOM/tokens payload itself.
+            storageRef: `juice:tokens-figma:${ctx.projectId}:${artifact.receivedAt}`,
+          },
+          onError,
+        ).catch((e) => onError(e, { at: 'sensor.conformanceSnapshotRef' }))
+      }
+    }
+
     return c.json({ ok: true, count: tokens.length, fileKey: artifact.fileKey })
   })
 
