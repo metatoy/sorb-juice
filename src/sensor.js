@@ -154,6 +154,27 @@ function envelope({ chainId, orgId, appId, mode, actorRole }) {
 }
 
 /**
+ * Public export of {@link envelope} for callers that build (and transport)
+ * sensor events WITHOUT going through insertEvent()'s Postgres write — namely
+ * E4's `src/resultSync.js` (Mode C: local bridge → cloud ingest over HTTP
+ * instead of a co-located INSERT). Keeps the envelope shape defined in
+ * exactly one place. `consent` here is always `true` in the returned object
+ * for parity with the DB path's contract (consent*, when relevant, is
+ * enforced by the CALLER before invoking this — see resultSync.js's
+ * isActive() gate, mirroring isConsented() above).
+ * @param {Object} args
+ * @param {string} args.chainId
+ * @param {string} args.orgId
+ * @param {string} args.appId
+ * @param {'A'|'B'|'C'} [args.mode]
+ * @param {'owner'|'admin'|'editor'|'viewer'|'system'} [args.actorRole]
+ * @returns {SensorEnvelope}
+ */
+export function buildEnvelope(args) {
+  return envelope(args)
+}
+
+/**
  * Best-effort INSERT into sensor_events. Never throws — callers get a boolean.
  * @param {import('./types.js').DbHandle} db
  * @param {SensorEnvelope & { type: string, [key: string]: unknown }} event

@@ -12,6 +12,7 @@ import { runStyleDictionary } from './transform'
 import { runCheck, formatCheckText, EXIT } from './check'
 import { openTokenPR } from './github'
 import { createCloudReader, resolveCloudConfig, headUrl } from './cloud'
+import { createResultSync, resolveResultSyncConfig } from './resultSync'
 import { initSentry, captureError, flushSentry } from './sentry'
 import { execFileSync, spawnSync } from 'child_process'
 import { encodeHandshake, toHandshakeLink } from './handshake'
@@ -192,6 +193,31 @@ program
     const db = await createDb(config)
     if (db && db.runMigrations) await db.runMigrations()
 
+    // E4 (Mode C result-sync) — ADDITIVE + opt-in. resolveResultSyncConfig()
+    // returns null unless an org key is present (SORB_ORG_KEY env or
+    // sorb.config.json `orgKey`), so the local bridge for anyone who hasn't
+    // created an account is untouched: no resultSync instance, no
+    // onLocalResultSync hook passed to createServer (it keeps its own
+    // zero-cost default), zero extra network activity.
+    const resultSyncCfg = resolveResultSyncConfig(fileConfig)
+    const resultSync = resultSyncCfg
+      ? createResultSync({
+          ...resultSyncCfg,
+          onError: (err, ctx) =>
+            console.error(
+              pc.yellow('  ⚠ result-sync: ') + (err && err.message ? err.message : String(err)) +
+                (ctx && ctx.at ? pc.dim(` (${ctx.at})`) : ''),
+            ),
+        })
+      : null
+    if (resultSync) {
+      resultSync.start()
+      console.log(
+        pc.dim('  Account   :') +
+          ` synced to ${resultSyncCfg.cloudBase} (labeled outcomes only — never raw app data; entitlement-gated opt-out honored)`,
+      )
+    }
+
     const app = createServer({
       store,
       config,
@@ -200,6 +226,7 @@ program
       getResolvedTokens: readResolved,
       getArtifactIndex: readIndex,
       getArtifact: readArtifact,
+      onLocalResultSync: resultSync ? (type, args) => resultSync.record(type, args) : undefined,
     })
 
     // C2: bind the local bridge to 127.0.0.1 only (loopback), NOT 0.0.0.0
@@ -232,6 +259,7 @@ program
             pc.dim(' or free it.\n'),
         )
         try { stop() } catch (e) { /* best-effort */ }
+        if (resultSync) { try { resultSync.stop() } catch (e) { /* best-effort */ } }
         try { await store.close() } catch (e) { /* best-effort */ }
         process.exit(1)
       }
@@ -241,6 +269,13 @@ program
     process.on('SIGINT', async () => {
       stop()
       if (cloud) cloud.stop()
+      if (resultSync) {
+        // Best-effort final flush so a clean Ctrl-C doesn't strand the last
+        // batch of labeled outcomes in memory. Bounded by timeoutMs inside
+        // flush() — never hangs shutdown.
+        try { await resultSync.flush() } catch (e) { /* best-effort */ }
+        try { resultSync.stop() } catch (e) { /* best-effort */ }
+      }
       try { await store.close() } catch (e) { /* best-effort shutdown */ }
       if (db) {
         try { await db.close() } catch (e) { /* best-effort shutdown */ }

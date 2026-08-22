@@ -25,6 +25,17 @@ import {
   recordConformanceSnapshotRef,
 } from './sensor.js'
 
+// E4 (Mode C result-sync) sentinel default for `onLocalResultSync` — a plain
+// `() => {}` default param is indistinguishable from a caller explicitly
+// passing a no-op, so identity-checking THIS constant is how createServer
+// below decides whether to pay for the extra local bookkeeping (chain-id
+// tracking + a store.onUpdate subscription per preview) at all. Anyone who
+// didn't wire an account (cli.js only passes a real hook once
+// resolveResultSyncConfig() found an org key) gets ZERO extra listeners
+// registered — the free local bridge stays byte-for-byte unchanged, not just
+// response-shape-unchanged.
+const NOOP_LOCAL_RESULT_SYNC = () => {}
+
 /**
  * Build the Hono bridge app. All preview/verify state lives in the injected
  * `store` (see storeInterface) — this module keeps NO in-memory Maps and no
@@ -84,6 +95,16 @@ export const createServer = ({
   getArtifactIndex = () => null,
   getArtifact = () => null,
   onError = () => {},
+  // E4 (Mode C result-sync): optional hook, ADDITIVE + opt-in. Called ONLY in
+  // LOCAL mode (never `hosted` — that path already has its own DB-backed E2
+  // sensor recording above) with `(type, args)` matching one of
+  // resultSync.js's build*Event() arg shapes. Default no-op means the free
+  // local bridge is byte-for-byte unchanged for anyone who didn't wire an
+  // account (cli.js only passes a real hook when SORB_ORG_KEY/config.orgKey
+  // resolved — see resultSync.resolveResultSyncConfig). Never awaited, always
+  // wrapped in try/catch at each call site — a sync failure can't affect the
+  // response.
+  onLocalResultSync = NOOP_LOCAL_RESULT_SYNC,
 }) => {
   const namespace = config.namespace
   const corsOrigin =
@@ -132,6 +153,20 @@ export const createServer = ({
   // store write, consumed (and removed) the moment the listener fires. Only
   // ever populated in hosted mode.
   const explicitDiscards = new Set()
+
+  // E4 (Mode C result-sync) — preview id -> chain_id, minted locally so a
+  // later /verify or DELETE /preview/:id can correlate its result-sync event
+  // back to the originating proposal. Mirrors the hosted mode's
+  // `previews.chain_id` column, but in-memory (this process's lifetime is the
+  // correlation window — same bound as the local store's own preview TTL).
+  // Only ever populated when !hosted.
+  const localChainIds = new Map()
+
+  // E4 (Mode C result-sync): whether a REAL hook was wired (see
+  // NOOP_LOCAL_RESULT_SYNC's doc comment) — gates every extra bit of local
+  // bookkeeping (chain-id map writes, store.onUpdate subscriptions) so the
+  // free local bridge pays zero cost when no account is configured.
+  const resultSyncActive = onLocalResultSync !== NOOP_LOCAL_RESULT_SYNC
 
   const app = new Hono()
 
@@ -574,10 +609,43 @@ export const createServer = ({
       return c.json({ id, url })
     }
 
-    // LOCAL mode — unchanged.
+    // LOCAL mode — unchanged, PLUS the optional E4 result-sync hook below
+    // (a strict no-op when onLocalResultSync wasn't wired — see its doc
+    // comment above — so this stays byte-for-byte the free local bridge).
     const tokens = await c.req.json()
     const id = nanoid(8)
     await store.putPreview(id, tokens)
+
+    // E4 (Mode C result-sync): emit `proposal`, then subscribe to this ONE
+    // preview's terminal delete to emit `accept_reject` (rejected —
+    // explicit_discard or ttl_expiry), mirroring the hosted branch's E2
+    // wiring above but routed through the local hook instead of a DB insert.
+    // chainId is minted + tracked here (not in resultSync.js) so it's stable
+    // across the whole proposal -> verify -> accept/reject cycle for this id.
+    // Entirely skipped (zero extra listeners/bookkeeping) when no account is
+    // configured — see resultSyncActive's doc comment.
+    if (resultSyncActive) {
+      const chainId = mintChainId()
+      localChainIds.set(id, chainId)
+      try {
+        onLocalResultSync('proposal', { chainId, previewId: id, tokens })
+      } catch (e) {
+        onError(e, { at: 'resultSync.proposal', id })
+      }
+      const unsubscribeLocalTerminal = store.onUpdate(id, (evt) => {
+        if (evt.type !== 'delete') return
+        unsubscribeLocalTerminal()
+        const signal = explicitDiscards.has(id) ? 'explicit_discard' : 'ttl_expiry'
+        explicitDiscards.delete(id)
+        localChainIds.delete(id)
+        try {
+          onLocalResultSync('accept_reject', { chainId, previewId: id, outcome: 'rejected', signal })
+        } catch (e) {
+          onError(e, { at: 'resultSync.acceptReject', id })
+        }
+      })
+    }
+
     const url = `?preview=${id}`
     return c.json({ id, url })
   })
@@ -683,6 +751,13 @@ export const createServer = ({
       }
       return c.json({ deleted: true })
     }
+    // E4 (Mode C result-sync): mark explicit-discard BEFORE the store write —
+    // same ordering requirement as the hosted branch's explicitDiscards.add()
+    // above — so the terminal store.onUpdate('delete') listener registered in
+    // POST /preview (only present when resultSyncActive) reports
+    // 'explicit_discard' rather than 'ttl_expiry'. A no-op Set.add() when no
+    // listener will ever consume it.
+    if (resultSyncActive) explicitDiscards.add(id)
     await store.deletePreview(id)
     return c.json({ deleted: true })
   })
@@ -784,6 +859,31 @@ export const createServer = ({
           }
         } catch (e) {
           onError(e, { at: 'sensor.verifyResult.lookup', id })
+        }
+      }
+    }
+
+    // E4 (Mode C result-sync): the LOCAL-mode mirror of the `!hosted` proxy
+    // reported above — same PROXY caveat (POST /verify has no real geometry
+    // diff yet). Only fires when previewId correlates to a chain_id this
+    // process minted (POST /preview) — i.e. only for previews created in
+    // THIS local-bridge session, and only when resultSyncActive.
+    if (!hosted && resultSyncActive && previewId) {
+      const chainId = localChainIds.get(previewId)
+      if (chainId) {
+        const boundFields = (meta && typeof meta.boundFields === 'number') ? meta.boundFields : null
+        const proxyCount = Number.isFinite(boundFields) ? boundFields : 0
+        try {
+          onLocalResultSync('verify_result', {
+            chainId,
+            check: 'figma_geometry',
+            ok: true,
+            checked: proxyCount,
+            matched: proxyCount,
+            mismatchCount: 0,
+          })
+        } catch (e) {
+          onError(e, { at: 'resultSync.verifyResult', id })
         }
       }
     }
@@ -1027,6 +1127,30 @@ export const createServer = ({
       }
     }
 
+    // E4 (Mode C result-sync): the LOCAL-mode mirror — genuine (non-proxy)
+    // counts, same as the hosted branch above. Only fires for a previewId
+    // this local-bridge session minted a chain_id for.
+    if (!hosted && resultSyncActive) {
+      const previewId = body && body.previewId
+      if (previewId) {
+        const chainId = localChainIds.get(previewId)
+        if (chainId) {
+          try {
+            onLocalResultSync('verify_result', {
+              chainId,
+              check: 'app_values',
+              ok: result.ok,
+              checked: result.checked,
+              matched: result.matched,
+              mismatchCount: result.mismatches.length,
+            })
+          } catch (e) {
+            onError(e, { at: 'resultSync.verifyResult' })
+          }
+        }
+      }
+    }
+
     return c.json(result)
   })
 
@@ -1120,6 +1244,22 @@ export const createServer = ({
           },
           onError,
         ).catch((e) => onError(e, { at: 'sensor.conformanceSnapshotRef' }))
+      }
+    }
+
+    // E4 (Mode C result-sync): LOCAL-mode mirror — same standalone-chain-id
+    // assumption as the hosted branch above (no preview to correlate
+    // against). storageRef stays a pointer into juice's own local Figma-
+    // artifact store, never the tokens payload itself.
+    if (!hosted && resultSyncActive) {
+      try {
+        onLocalResultSync('conformance_snapshot_ref', {
+          chainId: mintChainId(),
+          snapshotId: nanoid(8),
+          storageRef: `juice:tokens-figma:local:${artifact.receivedAt}`,
+        })
+      } catch (e) {
+        onError(e, { at: 'resultSync.conformanceSnapshotRef' })
       }
     }
 
