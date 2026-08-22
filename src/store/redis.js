@@ -23,6 +23,19 @@ const FIGMA_ARTIFACT_KEY = 'figma:artifact'
 
 const previewKey = (id) => PREVIEW_PREFIX + id
 const verifyKey = (id) => VERIFY_PREFIX + id
+// E1 push channel — one pub/sub channel per preview id, namespaced off the
+// same key so ops tooling (redis-cli) has one pattern to grep for both the
+// value and its event stream.
+const previewEventsChannel = (id) => previewKey(id) + ':events'
+
+// GOTCHA (ported from experiments/sorb-bridge-modes/relay-spike/NOTES.md #8):
+// Redis key-expiry (our PX TTL) is NOT observable as a publish/subscribe
+// message unless `notify-keyspace-events` is enabled on the server — a
+// preview that dies of natural TTL expiry does NOT push a `delete` event to
+// SSE subscribers the way the memory store's setTimeout-based expiry does.
+// Deliberately not fixed here (would require a deployment-side Redis config
+// change, out of scope for this port): subscribers on an expired preview
+// just go quiet (still get pings) rather than seeing an explicit `delete`.
 
 /**
  * Count keys matching a glob pattern via non-blocking SCAN.
@@ -46,29 +59,98 @@ const scanCount = async (client, match) => {
  * Create the Redis-backed Store.
  *
  * @param {import('../types').Config} config
+ * @param {Object} [deps] Dependency injection, TEST-ONLY. Production call
+ *   sites (store/index.js) always call `createRedisStore(config)` with no
+ *   second argument, so this is purely additive — it exists so
+ *   src/store/redis.test.js can exercise the real pub/sub wiring below
+ *   against a Redis-shaped fake client instead of only code review (this
+ *   repo has no live Redis to test against — see NOTES.md in the E1 spike
+ *   this was ported from).
+ * @param {import('ioredis').Redis} [deps.client] Pre-built client (skips
+ *   `new Redis(...)` + `.connect()` — the fake is already "connected").
  * @returns {Promise<import('../types').Store>}
  */
-export const createRedisStore = async (config) => {
+export const createRedisStore = async (config, deps = {}) => {
   const ttlMs = config.previewTtlMs
 
-  // lazyConnect so construction never throws on an unreachable Redis; we connect
-  // explicitly and surface failures through ping() / the /ready check.
-  const client = new Redis(config.redisUrl, {
-    lazyConnect: true,
-    maxRetriesPerRequest: 2,
-  })
+  let client = deps.client
+  if (!client) {
+    // lazyConnect so construction never throws on an unreachable Redis; we
+    // connect explicitly and surface failures through ping() / the /ready check.
+    client = new Redis(config.redisUrl, {
+      lazyConnect: true,
+      maxRetriesPerRequest: 2,
+    })
 
-  // ioredis emits 'error' asynchronously; without a listener an unreachable
-  // server would crash the process with an unhandled 'error' event.
-  client.on('error', () => {
-    // Swallowed — surfaced via ping(); reconnection is handled by ioredis.
-  })
+    // ioredis emits 'error' asynchronously; without a listener an unreachable
+    // server would crash the process with an unhandled 'error' event.
+    client.on('error', () => {
+      // Swallowed — surfaced via ping(); reconnection is handled by ioredis.
+    })
 
-  try {
-    await client.connect()
-  } catch (e) {
-    // Defer hard failure to ping()/usage rather than crashing the factory.
-    void e
+    try {
+      await client.connect()
+    } catch (e) {
+      // Defer hard failure to ping()/usage rather than crashing the factory.
+      void e
+    }
+  }
+
+  // ─── PUSH (onUpdate) ──────────────────────────────────────────────────────
+  // A SEPARATE connection for SUBSCRIBE — a redis client can't issue normal
+  // commands on a connection that's in subscribe mode (ioredis convention:
+  // client.duplicate()). Created LAZILY on the first onUpdate() call so a
+  // deployment that never uses SSE (e.g. Mode C / poll-only consumers) never
+  // opens the second connection.
+  /** @type {import('ioredis').Redis | null} */
+  let subscriberClient = null
+  /** @type {Map<string, Set<(evt: import('../types').PreviewUpdateEvent) => void>>} */
+  const listenersByChannel = new Map()
+
+  const ensureSubscriber = () => {
+    if (subscriberClient) return subscriberClient
+    subscriberClient = client.duplicate()
+    subscriberClient.on('error', () => {
+      // Swallowed — same posture as the primary client; a dead subscriber
+      // connection surfaces as subscribers stalling, not a process crash.
+    })
+    subscriberClient.on('message', (channel, message) => {
+      const set = listenersByChannel.get(channel)
+      if (!set || set.size === 0) return
+      let payload
+      try {
+        payload = JSON.parse(message)
+      } catch (e) {
+        return
+      }
+      for (const listener of set) listener(payload)
+    })
+    return subscriberClient
+  }
+
+  /** @param {string} id @param {'put'|'update'|'delete'} type @param {unknown} tokens */
+  const publishUpdate = async (id, type, tokens) => {
+    await client.publish(previewEventsChannel(id), JSON.stringify({ type, tokens }))
+  }
+
+  /** @type {import('../types').Store['onUpdate']} */
+  const onUpdate = (id, listener) => {
+    const sub = ensureSubscriber()
+    const channel = previewEventsChannel(id)
+    if (!listenersByChannel.has(channel)) {
+      listenersByChannel.set(channel, new Set())
+      sub.subscribe(channel).catch(() => {})
+    }
+    listenersByChannel.get(channel).add(listener)
+    return () => {
+      const set = listenersByChannel.get(channel)
+      if (!set) return
+      set.delete(listener)
+      if (set.size === 0) {
+        listenersByChannel.delete(channel)
+        sub.unsubscribe(channel).catch(() => {})
+      }
+    }
   }
 
   // ─── PREVIEWS ─────────────────────────────────────────────────────────────
@@ -77,6 +159,7 @@ export const createRedisStore = async (config) => {
   const putPreview = async (id, tokens) => {
     const entry = { tokens, createdAt: Date.now() }
     await client.set(previewKey(id), JSON.stringify(entry), 'PX', ttlMs)
+    await publishUpdate(id, 'put', tokens)
   }
 
   /** @type {import('../types').Store['getPreview']} */
@@ -98,12 +181,14 @@ export const createRedisStore = async (config) => {
     if (!(await hasPreview(id))) return false
     const entry = { tokens, createdAt: Date.now() }
     await client.set(previewKey(id), JSON.stringify(entry), 'PX', ttlMs)
+    await publishUpdate(id, 'update', tokens)
     return true
   }
 
   /** @type {import('../types').Store['deletePreview']} */
   const deletePreview = async (id) => {
-    await client.del(previewKey(id))
+    const n = await client.del(previewKey(id))
+    if (n) await publishUpdate(id, 'delete', null)
   }
 
   /** @type {import('../types').Store['countPreviews']} */
@@ -187,6 +272,13 @@ export const createRedisStore = async (config) => {
     } catch (e) {
       void e
     }
+    if (subscriberClient) {
+      try {
+        await subscriberClient.quit()
+      } catch (e) {
+        void e
+      }
+    }
   }
 
   return {
@@ -202,6 +294,7 @@ export const createRedisStore = async (config) => {
     countVerifications,
     putFigmaArtifact,
     getFigmaArtifact,
+    onUpdate,
     ping,
     close,
   }

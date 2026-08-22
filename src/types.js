@@ -56,6 +56,9 @@
  *   localhost/127.0.0.1 + Figma allowlist). Used by the P0.3b CSRF guard.
  * @property {number} previewTtlMs TTL for previews + verifications, in ms.
  * @property {number} pruneIntervalMs In-memory prune interval, in ms.
+ * @property {number} [sseHeartbeatMs] Interval between `ping` frames on
+ *   GET /preview/:id/events (E1). Defaults to 20_000 in server.js when unset
+ *   — not currently sourced from env, just an injectable override for tests.
  * @property {string | undefined} figmaFileKey Optional Figma file key
  *   (SORB_FIGMA_FILE_KEY) this project's Variables live in. Informational
  *   only — surfaced by GET /verify/figma, never enforced.
@@ -110,8 +113,23 @@
  * @property {() => Promise<number>} countVerifications
  * @property {(artifact: FigmaArtifact) => Promise<void>} putFigmaArtifact
  * @property {() => Promise<FigmaArtifact | null>} getFigmaArtifact
+ * @property {(id: string, listener: (evt: PreviewUpdateEvent) => void) => (() => void)} onUpdate
+ *   Subscribe to put/update/delete events for one preview id. Returns an
+ *   unsubscribe function. This is the push primitive the SSE route (E1,
+ *   `GET /preview/:id/events`) is built on — it replaces the leaf SDK's poll
+ *   loop. Both the memory and Redis stores implement it (EventEmitter bus vs.
+ *   Redis pub/sub over a duplicated connection), so callers never know which
+ *   backend is behind it.
  * @property {() => Promise<boolean>} ping
  * @property {() => Promise<void>} close
+ */
+
+/**
+ * An event pushed by {@link Store.onUpdate} when a preview is created,
+ * updated, or deleted. `tokens` is null for a `delete` event.
+ * @typedef {Object} PreviewUpdateEvent
+ * @property {'put' | 'update' | 'delete'} type
+ * @property {TokenSet | null} tokens
  */
 
 /**

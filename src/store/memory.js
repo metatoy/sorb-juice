@@ -8,6 +8,16 @@
 //
 // All methods are async (return Promises) so this is drop-in interchangeable
 // with the Redis-backed store from the server's perspective.
+//
+// E1 (hosted-relay hardening, ported from experiments/sorb-bridge-modes/
+// relay-spike/store.js): `onUpdate` adds a push primitive over an
+// EventEmitter bus, keyed by preview id, so the SSE route can push
+// put/update/delete events to subscribers instead of the leaf SDK polling
+// GET /preview/:id. `bus.setMaxListeners(0)` is load-bearing, not decorative
+// — Node's default max-10-listeners warning fires with realistic concurrent
+// SSE subscriber counts on one preview (spike load-tested 50 on one id).
+
+import { EventEmitter } from 'node:events'
 
 /**
  * Create the in-memory Store.
@@ -21,6 +31,11 @@ export const createMemoryStore = (config) => {
 
   /** @type {Map<string, import('../types').PreviewEntry>} */
   const previews = new Map()
+
+  // Push bus for onUpdate() — one EventEmitter, events named by preview id.
+  // Only previews get push events (verifications/Figma artifacts are polled).
+  const bus = new EventEmitter()
+  bus.setMaxListeners(0)
 
   // Plugin self-reports each inserted component's post-layout geometry here:
   // { storyId, bbox, meta, createdAt }. `latestVerifyId` tracks the newest so
@@ -44,7 +59,10 @@ export const createMemoryStore = (config) => {
   const pruneTimer = setInterval(() => {
     const now = Date.now()
     for (const [id, entry] of previews) {
-      if (isExpired(entry, now)) previews.delete(id)
+      if (isExpired(entry, now)) {
+        previews.delete(id)
+        bus.emit(id, { type: 'delete', tokens: null })
+      }
     }
     for (const [id, entry] of verifications) {
       if (isExpired(entry, now)) {
@@ -62,6 +80,7 @@ export const createMemoryStore = (config) => {
   /** @type {import('../types').Store['putPreview']} */
   const putPreview = async (id, tokens) => {
     previews.set(id, { tokens, createdAt: Date.now() })
+    bus.emit(id, { type: 'put', tokens })
   }
 
   /** @type {import('../types').Store['getPreview']} */
@@ -70,6 +89,7 @@ export const createMemoryStore = (config) => {
     if (!entry) return null
     if (isExpired(entry, Date.now())) {
       previews.delete(id)
+      bus.emit(id, { type: 'delete', tokens: null })
       return null
     }
     return entry
@@ -86,12 +106,21 @@ export const createMemoryStore = (config) => {
     // (and non-expired) entry. Refreshes createdAt → refreshes TTL.
     if (!(await hasPreview(id))) return false
     previews.set(id, { tokens, createdAt: Date.now() })
+    bus.emit(id, { type: 'update', tokens })
     return true
   }
 
   /** @type {import('../types').Store['deletePreview']} */
   const deletePreview = async (id) => {
+    const existed = previews.has(id)
     previews.delete(id)
+    if (existed) bus.emit(id, { type: 'delete', tokens: null })
+  }
+
+  /** @type {import('../types').Store['onUpdate']} */
+  const onUpdate = (id, listener) => {
+    bus.on(id, listener)
+    return () => bus.off(id, listener)
   }
 
   /** @type {import('../types').Store['countPreviews']} */
@@ -174,6 +203,7 @@ export const createMemoryStore = (config) => {
     countVerifications,
     putFigmaArtifact,
     getFigmaArtifact,
+    onUpdate,
     ping,
     close,
   }

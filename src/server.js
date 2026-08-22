@@ -1,5 +1,6 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
+import { streamSSE } from 'hono/streaming'
 import { nanoid } from 'nanoid'
 import { resolveApiKey, SCOPE } from './auth.js'
 import { getEntitlements, effectiveEntitlements, FREE } from './entitlements.js'
@@ -100,6 +101,13 @@ export const createServer = ({
   // configured (default 24h) window for Free orgs.
   const previewTtlMs = config.previewTtlMs || 86_400_000
 
+  // E1: SSE heartbeat interval for GET /preview/:id/events. Periodic pings are
+  // load-bearing, not decorative (ported finding from the relay-spike) — they
+  // let the server detect a half-dead connection isn't hung, and stop
+  // intermediary proxies (Traefik/Coolify) or node-server's own idle timeout
+  // from killing an otherwise-idle stream.
+  const sseHeartbeatMs = config.sseHeartbeatMs || 20_000
+
   // Activity log: namespace → [{displayName, verifiedAt}], max 20 entries, 24h TTL.
   const activityLog = new Map()
   const ACTIVITY_MAX = 20
@@ -110,6 +118,117 @@ export const createServer = ({
   }
 
   const app = new Hono()
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // E1 — GET /orgs/:orgId/preview/:id/subscribe (SSE push)
+  //
+  // The leaf SDK subscribes here to receive live preview updates instead of
+  // polling GET /preview/:id. Ported/promoted from the relay-spike
+  // (experiments/sorb-bridge-modes/relay-spike). Registered FIRST — before the
+  // hosted header-auth + CORS middleware below — because the browser
+  // EventSource API cannot set request headers, so this route authenticates
+  // via a ?key= query param and must not be 401'd by the header middleware.
+  // Being registered first, its Response short-circuits the middleware chain.
+  //
+  // AUTH (hosted mode): ?key=<publishable-or-secret-key>. Missing/invalid →
+  // 401. Any tenant mismatch → 404 (never 403) so cross-tenant existence is
+  // never revealed — same posture as GET /preview/:id. LOCAL mode (no
+  // databaseUrl): OPEN, no key required, :orgId is ignored — byte-for-byte the
+  // free bridge's no-auth behavior.
+  //
+  // FRAME CONTRACT (each SSE frame's `data:` is a JSON object):
+  //   - on connect:      { type: 'snapshot', tokens }
+  //   - on store change:  { type: 'update', tokens }   (put + update both → 'update')
+  //                       { type: 'delete', tokens: null }
+  //   - idle keepalive:   { type: 'ping' }  every sseHeartbeatMs
+  //   Frames use the default (message) SSE event so EventSource.onmessage
+  //   receives them; each carries a monotonically increasing `id:` from 1.
+  app.get('/orgs/:orgId/preview/:id/subscribe', async (c) => {
+    const pathOrgId = c.req.param('orgId')
+    const id = c.req.param('id')
+
+    if (hosted) {
+      const key = c.req.query('key')
+      let ctx
+      try {
+        ctx = await resolveApiKey(db, key ? `Bearer ${key}` : null)
+      } catch (e) {
+        onError(e, { at: 'subscribe.auth', id })
+        return c.json({ error: 'Service unavailable', code: 'db_unavailable' }, 503)
+      }
+      if (!ctx) {
+        return c.json({ error: 'Unauthorized', code: 'unauthorized' }, 401)
+      }
+      // Tenant scope: authed org must match the path org AND the preview must
+      // belong to the authed project. Any mismatch ⇒ 404 (existence hidden).
+      if (ctx.orgId !== pathOrgId) {
+        return c.json({ error: 'Preview not found or expired' }, 404)
+      }
+      let owned = false
+      try {
+        const res = await db.query(
+          'SELECT 1 FROM previews WHERE id = $1 AND project_id = $2 LIMIT 1',
+          [id, ctx.projectId],
+        )
+        owned = Boolean(res && res.rows && res.rows.length)
+      } catch (e) {
+        onError(e, { at: 'preview.owner', method: 'subscribe', id })
+        return c.json({ error: 'Service unavailable', code: 'db_unavailable' }, 503)
+      }
+      if (!owned) {
+        return c.json({ error: 'Preview not found or expired' }, 404)
+      }
+    }
+
+    const existing = await store.getPreview(id)
+    if (!existing) {
+      return c.json({ error: 'Preview not found or expired' }, 404)
+    }
+
+    // This route bypasses the global CORS middleware (registered after it), so
+    // reflect the caller's Origin for the EventSource fetch. Safe: the route is
+    // ?key=-authenticated in hosted mode (and a read), open in local mode.
+    const origin = c.req.header('Origin')
+    if (origin) c.header('Access-Control-Allow-Origin', origin)
+
+    return streamSSE(c, async (stream) => {
+      let closed = false
+      let seq = 0
+
+      const send = async (payload) => {
+        if (closed || stream.closed) return
+        seq += 1
+        try {
+          await stream.writeSSE({ data: JSON.stringify(payload), id: String(seq) })
+        } catch (e) {
+          // Write to a closed/reset socket — treat as disconnect.
+          closed = true
+        }
+      }
+
+      await send({ type: 'snapshot', tokens: existing.tokens })
+
+      const unsubscribe = store.onUpdate(id, (evt) => {
+        if (evt.type === 'delete') send({ type: 'delete', tokens: null })
+        else send({ type: 'update', tokens: evt.tokens })
+      })
+
+      stream.onAbort(() => {
+        closed = true
+        unsubscribe()
+      })
+
+      // Hold the connection open with periodic pings until the client
+      // disconnects (onAbort flips `closed`) or the stream otherwise closes.
+      while (!closed && !stream.closed) {
+        await stream.sleep(sseHeartbeatMs)
+        if (!closed && !stream.closed) {
+          await send({ type: 'ping' })
+        }
+      }
+      unsubscribe()
+    })
+  })
 
   // ───────────────────────────────────────────────────────────────────────────
   // Binding graph (roadmap §7 copy/paste theming) — lazy-built + cached.
