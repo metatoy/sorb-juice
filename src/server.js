@@ -332,6 +332,18 @@ export const createServer = ({
     //    populated by the time CORS decides the Access-Control-Allow-Origin
     //    header for real (keyed) requests. Preflight (OPTIONS) carries no
     //    Authorization header, so we skip auth for it and let CORS answer it.
+    // Auth early-returns (401/503) happen BEFORE the CORS middleware runs, so
+    // without this they'd carry no Access-Control-Allow-Origin header and a
+    // browser would surface them as an opaque "Failed to fetch" instead of a
+    // readable status — masking auth/DB errors for the null-origin Figma plugin
+    // (canopy). Echo the request Origin on these error responses so the client
+    // can read the real status. Safe: a 401/503 body carries no tenant data, and
+    // no cookies/credentials are involved (Bearer-token auth only).
+    const echoErrorCors = (c) => {
+      const o = c.req.header('Origin')
+      if (o) c.header('Access-Control-Allow-Origin', o)
+    }
+
     app.use('*', async (c, next) => {
       const path = c.req.path
       if (path === '/health' || path === '/ready') return next()
@@ -346,9 +358,11 @@ export const createServer = ({
         // DB outage during auth lookup — fail CLOSED, never fall through to
         // open/local behavior.
         onError(e, { at: 'auth' })
+        echoErrorCors(c)
         return c.json({ error: 'Service unavailable', code: 'db_unavailable' }, 503)
       }
       if (!ctx) {
+        echoErrorCors(c)
         return c.json({ error: 'Unauthorized', code: 'unauthorized' }, 401)
       }
       c.set('auth', ctx)
@@ -359,6 +373,7 @@ export const createServer = ({
         ent = effectiveEntitlements(await getEntitlements(db, ctx.orgId))
       } catch (e) {
         onError(e, { at: 'entitlements' })
+        echoErrorCors(c)
         return c.json({ error: 'Service unavailable', code: 'db_unavailable' }, 503)
       }
       c.set('ent', ent)
