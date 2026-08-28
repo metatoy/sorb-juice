@@ -7,7 +7,7 @@
 // `provision` is intentionally unimplemented — that's the future `github`
 // connector's job (v1 scope cut).
 
-import { registerCodeSource } from '@sorb/core'
+import * as core from '@sorb/core'
 
 /** @type {import('@sorb/core').CodeSourceConnector} */
 const localCodeSource = {
@@ -38,6 +38,13 @@ const localCodeSource = {
   },
 }
 
-registerCodeSource(localCodeSource)
+// Register into the @sorb/core connector registry WHEN this build's core
+// supports it. The published @sorb/core on npm can lag the connector contract
+// (polyrepo publish order) — in that case the registry fns are undefined, so we
+// skip registration and cli.js falls back to this connector directly. Guarding
+// here keeps the hosted bridge bootable against an older published core.
+if (typeof core.registerCodeSource === 'function') {
+  core.registerCodeSource(localCodeSource)
+}
 
 export default localCodeSource

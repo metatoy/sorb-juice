@@ -3,7 +3,32 @@ import { serve } from '@hono/node-server'
 import { readFileSync, existsSync, writeFileSync } from 'fs'
 import { resolve } from 'path'
 import pc from 'picocolors'
-import { getCodeSource, resolveConnectorIds } from '@sorb/core'
+import * as core from '@sorb/core'
+import localCodeSource from './codeSources/local'
+
+/**
+ * Resolve the active CODE-SOURCE connector. Prefers the @sorb/core registry
+ * (id-selectable via config.codeSource), but falls back to the built-in `local`
+ * connector when the installed @sorb/core predates the connector contract (the
+ * published npm version can lag the workspace — see codeSources/local.js). Same
+ * behavior either way: today's `local` default.
+ * @param {object} [config]
+ * @returns {import('@sorb/core').CodeSourceConnector}
+ */
+function resolveCodeSource(config) {
+  try {
+    if (
+      typeof core.resolveConnectorIds === 'function' &&
+      typeof core.getCodeSource === 'function'
+    ) {
+      return core.getCodeSource(core.resolveConnectorIds(config).codeSource)
+    }
+  } catch (e) {
+    // Registry unavailable or id unregistered — fall through to the local default.
+    void e
+  }
+  return localCodeSource
+}
 import { createServer } from './server'
 import { loadConfig } from './config'
 import { createStore } from './store/index'
@@ -133,7 +158,7 @@ program
 
     // CODE-SOURCE connector (default `local` = today's implicit cwd root; see
     // @sorb/core's connector contract). Pure indirection — no behavior change.
-    const codeSource = getCodeSource(resolveConnectorIds(fileConfig).codeSource)
+    const codeSource = resolveCodeSource(fileConfig)
     const projectRoot = codeSource.resolveProjectRoot(fileConfig)
 
     const sorbDir = resolve(projectRoot, '.sorb')
@@ -435,7 +460,7 @@ program
     }
 
     // CODE-SOURCE connector (default `local` = today's implicit cwd root).
-    const codeSource = getCodeSource(resolveConnectorIds(config).codeSource)
+    const codeSource = resolveCodeSource(config)
     const projectRoot = codeSource.resolveProjectRoot(config)
 
     const files = []
@@ -537,7 +562,7 @@ program
       // appUrl: --app > CODE-SOURCE connector (default `local` = config.appUrl
       // > default dev URL). Track the source so the invite output can say
       // where it came from.
-      const codeSource = getCodeSource(resolveConnectorIds(config).codeSource)
+      const codeSource = resolveCodeSource(config)
       const appUrl = opts.app || (await codeSource.resolveAppUrl(config)) || 'http://localhost:5173'
       const appUrlSource = opts.app ? '--app' : config.appUrl ? 'sorb.config.json' : 'default'
 
