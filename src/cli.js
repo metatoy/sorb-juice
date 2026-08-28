@@ -3,6 +3,7 @@ import { serve } from '@hono/node-server'
 import { readFileSync, existsSync, writeFileSync } from 'fs'
 import { resolve } from 'path'
 import pc from 'picocolors'
+import { getCodeSource, resolveConnectorIds } from '@sorb/core'
 import { createServer } from './server'
 import { loadConfig } from './config'
 import { createStore } from './store/index'
@@ -17,6 +18,9 @@ import { initSentry, captureError, flushSentry } from './sentry'
 import { execFileSync, spawnSync } from 'child_process'
 import { encodeHandshake, toHandshakeLink } from './handshake'
 import { probeUrl } from './probe'
+// Side-effect import: registers the default `local` CODE-SOURCE connector.
+// See spec/sorb/connectors-architecture.md §3.2 / §4 C2.
+import './codeSources/local'
 
 // ─── sorb.config.json loader ────────────────────────────────────────────────
 // The on-disk project config (namespace, token sources, port). Kept separate
@@ -127,7 +131,12 @@ program
     }
     console.log(pc.dim('  Port      :') + ` ${port}`)
 
-    const sorbDir = resolve(process.cwd(), '.sorb')
+    // CODE-SOURCE connector (default `local` = today's implicit cwd root; see
+    // @sorb/core's connector contract). Pure indirection — no behavior change.
+    const codeSource = getCodeSource(resolveConnectorIds(fileConfig).codeSource)
+    const projectRoot = codeSource.resolveProjectRoot(fileConfig)
+
+    const sorbDir = resolve(projectRoot, '.sorb')
     const resolvedPath = resolve(sorbDir, 'resolved.json')
     const indexPath = resolve(sorbDir, 'index.json')
 
@@ -162,7 +171,7 @@ program
     // editor with. Prefer a legacy flat token file if present; otherwise derive
     // a flat { cssVarName: value } map from the SD-built resolved map, so the
     // DTCG taxonomy works without a hand-maintained flat file.
-    const legacyTokenAbs = fileConfig.tokenPath ? resolve(process.cwd(), fileConfig.tokenPath) : null
+    const legacyTokenAbs = fileConfig.tokenPath ? resolve(projectRoot, fileConfig.tokenPath) : null
     const read = () => {
       if (legacyTokenAbs && existsSync(legacyTokenAbs)) {
         try { return JSON.parse(readFileSync(legacyTokenAbs, 'utf-8')) } catch (e) { return {} }
@@ -180,9 +189,9 @@ program
       const idx = readIndex()
       const entry = idx && idx.stories && idx.stories[storyId]
       if (!entry) return null
-      const artPath = resolve(process.cwd(), entry.artifact)
-      // Sanity: artifact path must be inside cwd.
-      if (!artPath.startsWith(process.cwd() + '/')) return null
+      const artPath = resolve(projectRoot, entry.artifact)
+      // Sanity: artifact path must be inside the project root.
+      if (!artPath.startsWith(projectRoot + '/')) return null
       return readJson(artPath)
     }
 
@@ -425,9 +434,13 @@ program
       process.exit(1)
     }
 
+    // CODE-SOURCE connector (default `local` = today's implicit cwd root).
+    const codeSource = getCodeSource(resolveConnectorIds(config).codeSource)
+    const projectRoot = codeSource.resolveProjectRoot(config)
+
     const files = []
     for (const rel of sources) {
-      const abs = resolve(process.cwd(), rel)
+      const abs = resolve(projectRoot, rel)
       if (existsSync(abs)) files.push({ path: rel, content: readFileSync(abs, 'utf-8') })
     }
 
@@ -521,9 +534,11 @@ program
       const port = config.port ?? 7777
       const origin = opts.origin || `http://127.0.0.1:${port}`
 
-      // appUrl: --app > config.appUrl > default dev URL. Track the source so
-      // the invite output can say where it came from.
-      const appUrl = opts.app || config.appUrl || 'http://localhost:5173'
+      // appUrl: --app > CODE-SOURCE connector (default `local` = config.appUrl
+      // > default dev URL). Track the source so the invite output can say
+      // where it came from.
+      const codeSource = getCodeSource(resolveConnectorIds(config).codeSource)
+      const appUrl = opts.app || (await codeSource.resolveAppUrl(config)) || 'http://localhost:5173'
       const appUrlSource = opts.app ? '--app' : config.appUrl ? 'sorb.config.json' : 'default'
 
       // gh: --gh > config.gh > derived from `git remote` > blank.
