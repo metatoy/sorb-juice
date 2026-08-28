@@ -107,6 +107,11 @@
  * @property {(id: string, tokens: TokenSet) => Promise<boolean>} updatePreview
  * @property {(id: string) => Promise<void>} deletePreview
  * @property {() => Promise<number>} countPreviews
+ * @property {() => Promise<({id: string} & PreviewEntry) | null>} getLatestPreview
+ *   The most-recently put/updated preview (LOCAL mode only — this pointer is
+ *   process-global, not tenant-scoped; hosted mode's GET /preview/latest
+ *   derives "latest" from the tenant-scoped `previews` DB table instead and
+ *   never calls this). Backs the cloud-snapshot dependency (#4b).
  * @property {(id: string, entry: { storyId: string, bbox: object, meta: object }) => Promise<void>} putVerification
  * @property {(id: string) => Promise<VerificationEntry | null>} getVerification
  * @property {() => Promise<VerificationEntry | null>} getLatestVerification

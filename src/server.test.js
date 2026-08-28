@@ -104,6 +104,39 @@ describe('bridge /verify', () => {
   })
 })
 
+describe('GET /preview/latest (local mode)', () => {
+  it('404 { error: "no_preview" } when nothing has been posted yet', async () => {
+    const app = await makeApp()
+    const res = await app.request('/preview/latest')
+    assert.equal(res.status, 404)
+    const body = await res.json()
+    assert.deepEqual(body, { error: 'no_preview' })
+  })
+
+  it('returns { id, tokens } for the most recently POSTed preview', async () => {
+    const app = await makeApp()
+    const post = await app.request('/preview', jsonInit({ '--btn-bg': '#abc' }))
+    const { id } = await post.json()
+    const res = await app.request('/preview/latest')
+    assert.equal(res.status, 200)
+    const body = await res.json()
+    assert.equal(body.id, id)
+    assert.deepEqual(body.tokens, { '--btn-bg': '#abc' })
+  })
+
+  it('tracks "latest" across multiple POSTs (newer wins)', async () => {
+    const app = await makeApp()
+    await app.request('/preview', jsonInit({ '--btn-bg': '#abc' }))
+    const second = await app.request('/preview', jsonInit({ '--btn-bg': '#def' }))
+    const { id: secondId } = await second.json()
+    const res = await app.request('/preview/latest')
+    assert.equal(res.status, 200)
+    const body = await res.json()
+    assert.equal(body.id, secondId)
+    assert.deepEqual(body.tokens, { '--btn-bg': '#def' })
+  })
+})
+
 describe('verify 404 before any report', () => {
   it('GET /verify/latest returns 404 on a fresh server with no verifications', async () => {
     const app = await makeApp()
@@ -439,6 +472,19 @@ const makeFakeDb = (opts = {}) => {
           typeof activeCount === 'function' ? activeCount(params[0]) : activeCount
         return { rows: [{ n }] }
       }
+      // ── latest-preview lookup (tenant-scoped, newest first): project_id=$1 ──
+      // ownedPreviews is a Map, which iterates in insertion order — the last
+      // entry matching this project stands in for "ORDER BY created_at DESC
+      // LIMIT 1" (good enough for these single-process tests).
+      if (text.startsWith('SELECT id FROM previews')) {
+        if (throwOnOwnership) throw new Error('connection refused')
+        const proj = params[0]
+        let latestId = null
+        for (const [id, p] of ownedPreviews) {
+          if (p === proj) latestId = id
+        }
+        return { rows: latestId ? [{ id: latestId }] : [] }
+      }
       // ── preview ownership check (tenant gate): id=$1 AND project_id=$2 ──
       if (text.startsWith('SELECT 1 FROM previews')) {
         if (throwOnOwnership) throw new Error('connection refused')
@@ -557,6 +603,60 @@ describe('hosted mode — scope (publishable = read-only)', () => {
     assert.equal(res.status, 200)
     const tokens = await res.json()
     assert.equal(tokens['--btn-bg'], '#abc')
+  })
+})
+
+describe('GET /preview/latest (hosted mode)', () => {
+  it('401 with no key', async () => {
+    const { app } = await makeHostedApp()
+    const res = await app.request('/preview/latest')
+    assert.equal(res.status, 401)
+  })
+
+  it('404 { error: "no_preview" } for a project with no previews', async () => {
+    const { app } = await makeHostedApp()
+    const res = await app.request('/preview/latest', { headers: bearer(SECRET_KEY) })
+    assert.equal(res.status, 404)
+    const body = await res.json()
+    assert.deepEqual(body, { error: 'no_preview' })
+  })
+
+  it('200 { id, tokens } for the caller\'s most recent preview', async () => {
+    const { app } = await makeHostedApp()
+    const post = await app.request('/preview', jsonAuth({ '--btn-bg': '#abc' }, SECRET_KEY))
+    const { id } = await post.json()
+    const res = await app.request('/preview/latest', { headers: bearer(SECRET_KEY) })
+    assert.equal(res.status, 200)
+    const body = await res.json()
+    assert.equal(body.id, id)
+    assert.deepEqual(body.tokens, { '--btn-bg': '#abc' })
+  })
+
+  it('a publishable (read-only) key MAY GET /preview/latest', async () => {
+    const { app } = await makeHostedApp()
+    const post = await app.request('/preview', jsonAuth({ '--btn-bg': '#abc' }, SECRET_KEY))
+    const { id } = await post.json()
+    const res = await app.request('/preview/latest', { headers: bearer(PUBLISHABLE_KEY) })
+    assert.equal(res.status, 200)
+    const body = await res.json()
+    assert.equal(body.id, id)
+  })
+
+  it('tenant isolation: B never sees A\'s latest preview', async () => {
+    const { app } = await makeHostedApp()
+    await app.request('/preview', jsonAuth({ '--btn-bg': '#aaa' }, SECRET_KEY))
+    const res = await app.request('/preview/latest', { headers: bearer(SECRET_KEY_B) })
+    assert.equal(res.status, 404)
+    const body = await res.json()
+    assert.deepEqual(body, { error: 'no_preview' })
+  })
+
+  it('503 (fail closed) when the db lookup throws', async () => {
+    const { app } = await makeHostedApp({ throwOnOwnership: true })
+    const res = await app.request('/preview/latest', { headers: bearer(SECRET_KEY) })
+    assert.equal(res.status, 503)
+    const body = await res.json()
+    assert.equal(body.code, 'db_unavailable')
   })
 })
 

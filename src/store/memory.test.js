@@ -95,3 +95,57 @@ describe('memory store — onUpdate', () => {
     await store.close()
   })
 })
+
+describe('memory store — getLatestPreview (#4b)', () => {
+  it('null on a fresh store', async () => {
+    const store = createMemoryStore(loadConfig())
+    assert.equal(await store.getLatestPreview(), null)
+    await store.close()
+  })
+
+  it('returns { id, tokens, createdAt } for the most recently put preview', async () => {
+    const store = createMemoryStore(loadConfig())
+    await store.putPreview('id-7', { a: 1 })
+    const latest = await store.getLatestPreview()
+    assert.equal(latest.id, 'id-7')
+    assert.deepEqual(latest.tokens, { a: 1 })
+    assert.equal(typeof latest.createdAt, 'number')
+    await store.close()
+  })
+
+  it('newer put wins', async () => {
+    const store = createMemoryStore(loadConfig())
+    await store.putPreview('id-8', { a: 1 })
+    await store.putPreview('id-9', { a: 2 })
+    const latest = await store.getLatestPreview()
+    assert.equal(latest.id, 'id-9')
+    await store.close()
+  })
+
+  it('updatePreview advances the latest pointer too', async () => {
+    const store = createMemoryStore(loadConfig())
+    await store.putPreview('id-10', { a: 1 })
+    await store.putPreview('id-11', { a: 2 })
+    await store.updatePreview('id-10', { a: 3 })
+    const latest = await store.getLatestPreview()
+    assert.equal(latest.id, 'id-10')
+    assert.deepEqual(latest.tokens, { a: 3 })
+    await store.close()
+  })
+
+  it('null after the latest preview is explicitly deleted', async () => {
+    const store = createMemoryStore(loadConfig())
+    await store.putPreview('id-12', { a: 1 })
+    await store.deletePreview('id-12')
+    assert.equal(await store.getLatestPreview(), null)
+    await store.close()
+  })
+
+  it('null after the latest preview TTL-expires', async () => {
+    const store = createMemoryStore(loadConfig({ PREVIEW_TTL_MS: '20' }))
+    await store.putPreview('id-13', { a: 1 })
+    await sleep(40)
+    assert.equal(await store.getLatestPreview(), null)
+    await store.close()
+  })
+})

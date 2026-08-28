@@ -91,6 +91,25 @@ const makeFakeRedis = () => {
       duplicate() {
         return makeClient()
       },
+      // Minimal ioredis-shaped multi()/exec() pipeline — putPreview/putVerification
+      // queue a couple of `set`s and exec() them in order. Real ioredis batches
+      // these over one round-trip; this fake just runs them sequentially against
+      // the same shared keyspace, which is observationally identical for these
+      // tests (no partial-failure semantics are exercised here).
+      multi() {
+        const ops = []
+        const chain = {
+          set(...args) {
+            ops.push(args)
+            return chain
+          },
+          async exec() {
+            for (const args of ops) await client.set(...args)
+            return ops.map(() => [null, 'OK'])
+          },
+        }
+        return chain
+      },
       on(event, handler) {
         if (event === 'message') onMessage = handler
         return client
@@ -197,6 +216,48 @@ describe('redis store — onUpdate (fake client)', () => {
     await sleep(20)
     assert.deepEqual(events, [])
     unsubscribe()
+    await store.close()
+  })
+})
+
+describe('redis store — getLatestPreview (#4b)', () => {
+  it('null on a fresh store', async () => {
+    const { makeClient } = makeFakeRedis()
+    const store = await createRedisStore(cfg(), { client: makeClient() })
+    assert.equal(await store.getLatestPreview(), null)
+    await store.close()
+  })
+
+  it('returns { id, tokens, createdAt } for the most recently put preview', async () => {
+    const { makeClient } = makeFakeRedis()
+    const store = await createRedisStore(cfg(), { client: makeClient() })
+    await store.putPreview('r-6', { a: 1 })
+    const latest = await store.getLatestPreview()
+    assert.equal(latest.id, 'r-6')
+    assert.deepEqual(latest.tokens, { a: 1 })
+    assert.equal(typeof latest.createdAt, 'number')
+    await store.close()
+  })
+
+  it('newer put wins', async () => {
+    const { makeClient } = makeFakeRedis()
+    const store = await createRedisStore(cfg(), { client: makeClient() })
+    await store.putPreview('r-7', { a: 1 })
+    await store.putPreview('r-8', { a: 2 })
+    const latest = await store.getLatestPreview()
+    assert.equal(latest.id, 'r-8')
+    await store.close()
+  })
+
+  it('updatePreview advances the latest pointer too', async () => {
+    const { makeClient } = makeFakeRedis()
+    const store = await createRedisStore(cfg(), { client: makeClient() })
+    await store.putPreview('r-9', { a: 1 })
+    await store.putPreview('r-10', { a: 2 })
+    await store.updatePreview('r-9', { a: 3 })
+    const latest = await store.getLatestPreview()
+    assert.equal(latest.id, 'r-9')
+    assert.deepEqual(latest.tokens, { a: 3 })
     await store.close()
   })
 })

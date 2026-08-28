@@ -9,6 +9,7 @@ import Redis from 'ioredis'
 
 // Key layout:
 //   preview:{id}   -> JSON { tokens, createdAt }        (PX = config.previewTtlMs)
+//   preview:latest -> the newest preview id              (PX = config.previewTtlMs)
 //   verify:{id}    -> JSON { storyId, bbox, meta, createdAt } (PX = config.previewTtlMs)
 //   verify:latest  -> the newest verify id              (PX = config.previewTtlMs)
 //
@@ -16,6 +17,7 @@ import Redis from 'ioredis'
 // don't block Redis and don't miscount when sharing a db). Redis' own PX TTL
 // handles expiry, so counts are naturally "active" (expired keys are gone).
 const PREVIEW_PREFIX = 'preview:'
+const PREVIEW_LATEST_KEY = 'preview:latest'
 const VERIFY_PREFIX = 'verify:'
 const VERIFY_LATEST_KEY = 'verify:latest'
 // Single "latest" snapshot (no TTL, no history) — mirrors the memory store.
@@ -158,7 +160,12 @@ export const createRedisStore = async (config, deps = {}) => {
   /** @type {import('../types').Store['putPreview']} */
   const putPreview = async (id, tokens) => {
     const entry = { tokens, createdAt: Date.now() }
-    await client.set(previewKey(id), JSON.stringify(entry), 'PX', ttlMs)
+    // Set the entry and advance the latest pointer together; same TTL so a
+    // stale "latest" pointer expires alongside its entry (mirrors verify:latest).
+    const pipeline = client.multi()
+    pipeline.set(previewKey(id), JSON.stringify(entry), 'PX', ttlMs)
+    pipeline.set(PREVIEW_LATEST_KEY, id, 'PX', ttlMs)
+    await pipeline.exec()
     await publishUpdate(id, 'put', tokens)
   }
 
@@ -180,20 +187,40 @@ export const createRedisStore = async (config, deps = {}) => {
     // entry. Re-setting with a fresh PX refreshes the TTL.
     if (!(await hasPreview(id))) return false
     const entry = { tokens, createdAt: Date.now() }
-    await client.set(previewKey(id), JSON.stringify(entry), 'PX', ttlMs)
+    const pipeline = client.multi()
+    pipeline.set(previewKey(id), JSON.stringify(entry), 'PX', ttlMs)
+    pipeline.set(PREVIEW_LATEST_KEY, id, 'PX', ttlMs)
+    await pipeline.exec()
     await publishUpdate(id, 'update', tokens)
     return true
   }
 
   /** @type {import('../types').Store['deletePreview']} */
   const deletePreview = async (id) => {
+    // Leave preview:latest as-is on an explicit delete (matches verify:latest's
+    // posture — no deleteVerification exists either): getLatestPreview() below
+    // re-checks the entry's own existence at read time, so a pointer left
+    // dangling after a delete just resolves to null rather than lying.
     const n = await client.del(previewKey(id))
     if (n) await publishUpdate(id, 'delete', null)
   }
 
   /** @type {import('../types').Store['countPreviews']} */
   const countPreviews = async () => {
-    return scanCount(client, PREVIEW_PREFIX + '*')
+    // preview:latest shares the preview: prefix; subtract it so the count
+    // matches the number of real preview entries (mirrors countVerifications).
+    const total = await scanCount(client, PREVIEW_PREFIX + '*')
+    const hasLatest = (await client.exists(PREVIEW_LATEST_KEY)) === 1
+    return hasLatest ? Math.max(0, total - 1) : total
+  }
+
+  /** @type {import('../types').Store['getLatestPreview']} */
+  const getLatestPreview = async () => {
+    const id = await client.get(PREVIEW_LATEST_KEY)
+    if (id == null) return null
+    const entry = await getPreview(id)
+    if (!entry) return null
+    return { id, tokens: entry.tokens, createdAt: entry.createdAt }
   }
 
   // ─── VERIFICATIONS ────────────────────────────────────────────────────────
@@ -288,6 +315,7 @@ export const createRedisStore = async (config, deps = {}) => {
     updatePreview,
     deletePreview,
     countPreviews,
+    getLatestPreview,
     putVerification,
     getVerification,
     getLatestVerification,

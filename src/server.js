@@ -670,6 +670,55 @@ export const createServer = ({
     return c.json({ id, url })
   })
 
+  // ─── GET /preview/latest ──────────────────────────────────────────────────
+  // The project's most-recently-pushed live preview (#4b dependency — lets
+  // sorb-cloud snapshot "what's currently being previewed" without knowing an
+  // id up front). MUST be registered before /preview/:id or Hono treats
+  // "latest" as an :id param. Read-only: allowed for BOTH publishable and
+  // secret scope in hosted mode (mirrors GET /preview/:id).
+  //
+  // Response contract (matched to the cloud agent's toResolved()):
+  //   200 { id, tokens } — tokens is exactly the shape POST/PUT /preview
+  //     stored (whatever the plugin pushed), under a `tokens` field.
+  //   404 { error: 'no_preview' } — no current preview for the caller.
+  app.get('/preview/latest', async (c) => {
+    if (hosted) {
+      const ctx = c.get('auth')
+      let row
+      try {
+        // Tenant-scoped "latest": the store itself has no per-project concept
+        // (see store.getLatestPreview's doc comment), so hosted mode sources
+        // the newest non-expired id from the same `previews` bookkeeping table
+        // GET/PUT/DELETE /preview/:id already use for tenant ownership.
+        const res = await db.query(
+          'SELECT id FROM previews WHERE project_id = $1 AND (expires_at IS NULL OR expires_at > now()) ORDER BY created_at DESC LIMIT 1',
+          [ctx.projectId],
+        )
+        row = res && res.rows && res.rows[0]
+      } catch (e) {
+        onError(e, { at: 'preview.latest.owner' })
+        return c.json({ error: 'Service unavailable', code: 'db_unavailable' }, 503)
+      }
+      if (!row) {
+        return c.json({ error: 'no_preview' }, 404)
+      }
+      const entry = await store.getPreview(row.id)
+      if (!entry) {
+        // DB bookkeeping row outlived the store entry (store TTL raced the DB
+        // row) — treat it the same as "no preview", never leak a stale id.
+        return c.json({ error: 'no_preview' }, 404)
+      }
+      return c.json({ id: row.id, tokens: entry.tokens })
+    }
+
+    // LOCAL mode — no auth, single global "latest" tracked by the store.
+    const latest = await store.getLatestPreview()
+    if (!latest) {
+      return c.json({ error: 'no_preview' }, 404)
+    }
+    return c.json({ id: latest.id, tokens: latest.tokens })
+  })
+
   // ─── GET /preview/:id ─────────────────────────────────────────────────────
   // React app polls this while a preview is active. Allowed for BOTH read
   // (publishable) and write (secret) scope in hosted mode.

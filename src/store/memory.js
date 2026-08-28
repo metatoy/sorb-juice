@@ -32,6 +32,14 @@ export const createMemoryStore = (config) => {
   /** @type {Map<string, import('../types').PreviewEntry>} */
   const previews = new Map()
 
+  // Most-recently put/updated preview id (LOCAL mode's "latest" pointer for
+  // GET /preview/latest — the cloud-snapshot dependency). Mirrors
+  // `latestVerifyId` below. Only meaningful in LOCAL mode: hosted mode derives
+  // "latest" from the tenant-scoped `previews` DB table instead (this pointer
+  // is process-global, not per-project).
+  /** @type {string | null} */
+  let latestPreviewId = null
+
   // Push bus for onUpdate() — one EventEmitter, events named by preview id.
   // Only previews get push events (verifications/Figma artifacts are polled).
   const bus = new EventEmitter()
@@ -61,6 +69,7 @@ export const createMemoryStore = (config) => {
     for (const [id, entry] of previews) {
       if (isExpired(entry, now)) {
         previews.delete(id)
+        if (id === latestPreviewId) latestPreviewId = null
         bus.emit(id, { type: 'delete', tokens: null })
       }
     }
@@ -80,6 +89,7 @@ export const createMemoryStore = (config) => {
   /** @type {import('../types').Store['putPreview']} */
   const putPreview = async (id, tokens) => {
     previews.set(id, { tokens, createdAt: Date.now() })
+    latestPreviewId = id
     bus.emit(id, { type: 'put', tokens })
   }
 
@@ -89,6 +99,7 @@ export const createMemoryStore = (config) => {
     if (!entry) return null
     if (isExpired(entry, Date.now())) {
       previews.delete(id)
+      if (id === latestPreviewId) latestPreviewId = null
       bus.emit(id, { type: 'delete', tokens: null })
       return null
     }
@@ -106,6 +117,7 @@ export const createMemoryStore = (config) => {
     // (and non-expired) entry. Refreshes createdAt → refreshes TTL.
     if (!(await hasPreview(id))) return false
     previews.set(id, { tokens, createdAt: Date.now() })
+    latestPreviewId = id
     bus.emit(id, { type: 'update', tokens })
     return true
   }
@@ -114,7 +126,17 @@ export const createMemoryStore = (config) => {
   const deletePreview = async (id) => {
     const existed = previews.has(id)
     previews.delete(id)
+    if (id === latestPreviewId) latestPreviewId = null
     if (existed) bus.emit(id, { type: 'delete', tokens: null })
+  }
+
+  /** @type {import('../types').Store['getLatestPreview']} */
+  const getLatestPreview = async () => {
+    const id = latestPreviewId
+    if (!id) return null
+    const entry = await getPreview(id)
+    if (!entry) return null
+    return { id, tokens: entry.tokens, createdAt: entry.createdAt }
   }
 
   /** @type {import('../types').Store['onUpdate']} */
@@ -197,6 +219,7 @@ export const createMemoryStore = (config) => {
     updatePreview,
     deletePreview,
     countPreviews,
+    getLatestPreview,
     putVerification,
     getVerification,
     getLatestVerification,
