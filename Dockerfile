@@ -53,9 +53,14 @@ USER node
 
 EXPOSE 7777
 
-# Liveness/readiness: hit /ready, which validates any configured backends.
-# Uses Node's built-in fetch (Node 20) so no extra tooling (curl/wget) needed.
+# Liveness: hit /health (store/Redis only — no Postgres). Deliberately NOT
+# /ready: /ready hard-requires Postgres, so a transient DB blip would mark the
+# container unhealthy and pull the WHOLE bridge from the load balancer (total
+# 503), even though Redis-served previews + /health still work. Postgres-backed
+# routes (entitlements/verify) degrade to per-request 503s on their own — a DB
+# blip must not take down preview serving. Uses Node's built-in fetch (Node 20)
+# so no extra tooling (curl/wget) needed.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||7777)+'/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||7777)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 CMD ["node", "dist/cli.js", "serve"]
