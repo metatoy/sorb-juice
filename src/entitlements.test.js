@@ -15,8 +15,8 @@ import {
 
 // ─── FREE constant ────────────────────────────────────────────────────────────
 
-test('FREE has maxCustomDomains: 0', () => {
-  assert.equal(FREE.maxCustomDomains, 0)
+test('FREE (v2.1 Basic) has maxCustomDomains: 1', () => {
+  assert.equal(FREE.maxCustomDomains, 1)
 })
 
 test('FREE has maxProjects: 1', () => {

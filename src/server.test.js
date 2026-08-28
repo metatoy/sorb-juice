@@ -591,18 +591,24 @@ describe('hosted mode — entitlements enforcement', () => {
     assert.equal(res.status, 200)
   })
 
-  it('FREE (no row) has unlimited count (-1) — never 402 on count', async () => {
-    const { app } = await makeHostedApp({ activeCount: 9999 })
+  it('Basic (no row, v2.1) caps active previews at 10 → 402 when over', async () => {
+    // v2.1: Basic previews are persistent but CAPPED at 10 (the fair-use ceiling),
+    // replacing the old unlimited-count/24h-TTL gate.
+    const { app } = await makeHostedApp({ activeCount: 10 })
     const res = await app.request('/preview', jsonAuth({ '--btn-bg': '#abc' }, SECRET_KEY))
-    assert.equal(res.status, 200)
+    assert.equal(res.status, 402)
+    const body = await res.json()
+    assert.equal(body.code, 'preview_limit')
   })
 
-  it('past_due Team degrades to Free gates (sharing locked → 402)', async () => {
+  it('sharing_locked 402 only on an explicit no-share override (v2.1: Basic shares by default)', async () => {
+    // v2.1 flips Basic to previewSharing:true, so a past_due degrade no longer locks
+    // sharing. The sharing gate now fires only when previewSharing is explicitly false.
     const { app } = await makeHostedApp({
       entitlementsRow: {
         plan: 'team',
-        status: 'past_due',
-        data: { previewSharing: true, maxActivePreviews: 10 },
+        status: 'active',
+        data: { previewSharing: false, maxActivePreviews: 10 },
       },
     })
     const res = await app.request('/preview?share=1', jsonAuth({ '--btn-bg': '#abc' }, SECRET_KEY))

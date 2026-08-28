@@ -378,6 +378,11 @@ export const createServer = ({
       cors({
         origin: (origin, c) => {
           if (!origin) return origin
+          // Figma plugin (canopy) runs in a sandboxed iframe with an opaque
+          // `null` origin — allow it so the plugin can read /health, /tokens,
+          // /verify. Safe: the pk key still gates all data; /health is public.
+          // Mirrors the /preview crossSiteWriteGuard's plugin allowance.
+          if (origin === 'null') return origin
           // Preflight: no body, no key — echo so the browser proceeds to the
           // real (authoritative) request.
           if (c.req.method === 'OPTIONS') return origin

@@ -17,36 +17,42 @@
  */
 
 /**
- * The frozen entitlements object, EXACT shape from payment-spec §4.
+ * The frozen entitlements object, EXACT shape from payment-spec §4 / §2b (v2.1).
+ * (AI + localOnlyNoSync fields are cloud-only — juice's preview/capture path
+ * doesn't enforce them, so they're intentionally omitted here.)
  * @typedef {object} Entitlements
  * @property {'free'|'team'|'enterprise'} plan
  * @property {'active'|'trialing'|'past_due'|'canceled'} status
  * @property {number} seats
+ * @property {number} maxSeats           -1 = unlimited (v2.1: Basic 3/Pro 10/Teams 50)
  * @property {boolean} previewPersistence
  * @property {boolean} previewSharing
  * @property {number} maxProjects        -1 = unlimited
  * @property {number} maxActivePreviews  -1 = unlimited
  * @property {boolean} captureEnabled
- * @property {number} maxCustomDomains   -1 = unlimited; 0 = no custom domains (Free)
+ * @property {'slow'|'faster'|'priority'|'dedicated'} captureThrottleTier  v2.1 speed lane
+ * @property {number} maxCustomDomains   -1 = unlimited; 0 = no custom domains
  */
 
 /**
- * The FREE baseline (payment-spec §4 Free row). Hosted Free = 1 project,
- * 1 seat, previews expire at 24h (no persistence), no sharing, no capture.
- * maxActivePreviews is -1 (unlimited COUNT on Free — the Free gate is the 24h
- * TTL + no sharing, not a count cap). Workers MUST treat -1 as unlimited.
+ * The FREE baseline = the v2.1 **Basic** ($0) tier (payment-spec §2b). Basic is a
+ * real rung now: previews PERSIST (no TTL) but are CAPPED at 10 (the fair-use
+ * ceiling → 402 when exceeded), sharing on, capture on a slow lane, 1 domain.
+ * MUST match sorb-cloud FREE_ENTITLEMENTS.
  * @type {Readonly<Entitlements>}
  */
 export const FREE = Object.freeze({
   plan: 'free',
   status: 'active',
   seats: 1,
-  previewPersistence: false,
-  previewSharing: false,
+  maxSeats: 3,
+  previewPersistence: true,
+  previewSharing: true,
   maxProjects: 1,
-  maxActivePreviews: -1,
-  captureEnabled: false,
-  maxCustomDomains: 0,
+  maxActivePreviews: 10,
+  captureEnabled: true,
+  captureThrottleTier: 'slow',
+  maxCustomDomains: 1,
 })
 
 /**
@@ -92,6 +98,11 @@ export function normalizeEntitlements(row) {
     plan: FREE.plan,
     status: FREE.status,
     seats: 'seats' in data ? Math.max(1, numOr(data.seats, FREE.seats)) : FREE.seats,
+    maxSeats: 'maxSeats' in data ? numOr(data.maxSeats, FREE.maxSeats) : FREE.maxSeats,
+    captureThrottleTier:
+      'captureThrottleTier' in data && typeof data.captureThrottleTier === 'string'
+        ? data.captureThrottleTier
+        : FREE.captureThrottleTier,
     previewPersistence:
       'previewPersistence' in data ? Boolean(data.previewPersistence) : FREE.previewPersistence,
     previewSharing: 'previewSharing' in data ? Boolean(data.previewSharing) : FREE.previewSharing,
