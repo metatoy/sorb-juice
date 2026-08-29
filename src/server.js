@@ -537,6 +537,18 @@ export const createServer = ({
   // ─── POST /preview ────────────────────────────────────────────────────────
   // Figma plugin POSTs a proposed token set here.
   // Returns a short preview ID the React app can use via ?preview=<id>
+  //
+  // BODY SHAPE (phase-2 dark mode): EITHER
+  //   - legacy flat  — a plain map { "--token": "value", ... } (today's shape), OR
+  //   - mode-aware   — { tokens: {...}, darkTokens?: {...}, darkMode?: {...} },
+  //     a wrapper object carrying a `tokens` key (detection: presence of a
+  //     `tokens` key on the body means mode-aware; a flat map never has one,
+  //     since CSS custom-property names always start with `--`).
+  // The bridge stores + returns the body VERBATIM in either shape — it never
+  // inspects, flattens, or strips fields. Store + routes are shape-agnostic by
+  // construction (see src/store/memory.js / redis.js: `tokens` is opaque JSON
+  // to both), so this needed no store change. Detection/interpretation of the
+  // shape is entirely a leaf/cloud-side concern.
   app.post('/preview', async (c) => {
     if (hosted) {
       const denied = requireWrite(c)
@@ -678,9 +690,22 @@ export const createServer = ({
   // secret scope in hosted mode (mirrors GET /preview/:id).
   //
   // Response contract (matched to the cloud agent's toResolved()):
-  //   200 { id, tokens } — tokens is exactly the shape POST/PUT /preview
+  //   200 { id, tokens } — `tokens` is exactly the shape POST/PUT /preview
   //     stored (whatever the plugin pushed), under a `tokens` field.
   //   404 { error: 'no_preview' } — no current preview for the caller.
+  //
+  // DARK-MODE ENVELOPE SEAM (phase-2): the stored body may itself be either a
+  // legacy flat map ({ "--token": "value" }) or a mode-aware wrapper
+  // ({ tokens, darkTokens, darkMode }) — see server.js's POST /preview comment.
+  // This route does NOT special-case that: `tokens` here is always the WHOLE
+  // stored body, unmodified — for a mode-aware preview that means the response
+  // is { id, tokens: { tokens, darkTokens, darkMode } }, i.e. this route's
+  // outer `tokens` field is "the preview body", not "the light-mode token map".
+  // Chosen over introducing a new top-level field (e.g. `preview`) to keep this
+  // route's response shape byte-for-byte unchanged for legacy flat previews
+  // (today's only consumers). Downstream (leaf/cloud): apply the SAME
+  // mode-aware detection (`'tokens' in body`) to this route's `tokens` field
+  // that you'd apply to a GET /preview/:id body directly.
   app.get('/preview/latest', async (c) => {
     if (hosted) {
       const ctx = c.get('auth')

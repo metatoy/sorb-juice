@@ -137,6 +137,86 @@ describe('GET /preview/latest (local mode)', () => {
   })
 })
 
+// Phase-2 dark-mode envelope: a preview body is EITHER a legacy flat map
+// ({ "--token": "value" }) OR a mode-aware wrapper ({ tokens, darkTokens,
+// darkMode }) — detected by the presence of a `tokens` key. The store/routes
+// are shape-agnostic (they never inspect the body), so both shapes round-trip
+// byte-for-byte through POST -> GET /preview/:id -> GET /preview/latest.
+describe('mode-aware preview envelope (phase-2 dark mode)', () => {
+  const MODE_AWARE_BODY = {
+    tokens: { '--btn-bg': '#fff', '--btn-fg': '#111' },
+    darkTokens: { '--btn-bg': '#111', '--btn-fg': '#fff' },
+    darkMode: { strategy: 'class', darkSelector: '.dark', lightSelector: ':root' },
+  }
+
+  it('POST /preview accepts a mode-aware body and returns { id, url } unchanged', async () => {
+    const app = await makeApp()
+    const res = await app.request('/preview', jsonInit(MODE_AWARE_BODY))
+    assert.equal(res.status, 200)
+    const body = await res.json()
+    assert.equal(typeof body.id, 'string')
+    assert.equal(typeof body.url, 'string')
+  })
+
+  it('GET /preview/:id returns the mode-aware body verbatim (tokens + darkTokens + darkMode)', async () => {
+    const app = await makeApp()
+    const post = await app.request('/preview', jsonInit(MODE_AWARE_BODY))
+    const { id } = await post.json()
+    const res = await app.request(`/preview/${id}`)
+    assert.equal(res.status, 200)
+    const body = await res.json()
+    assert.deepEqual(body, MODE_AWARE_BODY)
+  })
+
+  it('GET /preview/latest wraps the mode-aware body under `tokens` (the seam: tokens = the whole stored body)', async () => {
+    const app = await makeApp()
+    const post = await app.request('/preview', jsonInit(MODE_AWARE_BODY))
+    const { id } = await post.json()
+    const res = await app.request('/preview/latest')
+    assert.equal(res.status, 200)
+    const body = await res.json()
+    assert.equal(body.id, id)
+    // body.tokens IS the full stored preview body, not the light-mode token
+    // map — consumers must re-run the { tokens } detection on body.tokens.
+    assert.deepEqual(body.tokens, MODE_AWARE_BODY)
+    assert.deepEqual(body.tokens.tokens, MODE_AWARE_BODY.tokens)
+    assert.deepEqual(body.tokens.darkTokens, MODE_AWARE_BODY.darkTokens)
+    assert.deepEqual(body.tokens.darkMode, MODE_AWARE_BODY.darkMode)
+  })
+
+  it('PUT /preview/:id updates a mode-aware body in place and it round-trips', async () => {
+    const app = await makeApp()
+    const post = await app.request('/preview', jsonInit({ '--btn-bg': '#abc' }))
+    const { id } = await post.json()
+    const putRes = await app.request(`/preview/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(MODE_AWARE_BODY),
+    })
+    assert.equal(putRes.status, 200)
+    const res = await app.request(`/preview/${id}`)
+    const body = await res.json()
+    assert.deepEqual(body, MODE_AWARE_BODY)
+  })
+
+  it('legacy flat previews are unaffected — still round-trip as a plain map with no wrapper fields', async () => {
+    const app = await makeApp()
+    const flat = { '--btn-bg': '#abc', '--btn-fg': '#000' }
+    const post = await app.request('/preview', jsonInit(flat))
+    const { id } = await post.json()
+
+    const byId = await app.request(`/preview/${id}`)
+    assert.deepEqual(await byId.json(), flat)
+
+    const latest = await app.request('/preview/latest')
+    const latestBody = await latest.json()
+    assert.deepEqual(latestBody.tokens, flat)
+    // No mode-aware wrapper keys leak onto a legacy flat body.
+    assert.equal('darkTokens' in latestBody.tokens, false)
+    assert.equal('darkMode' in latestBody.tokens, false)
+  })
+})
+
 describe('verify 404 before any report', () => {
   it('GET /verify/latest returns 404 on a fresh server with no verifications', async () => {
     const app = await makeApp()
