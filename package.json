@@ -36,7 +36,7 @@
     "@hono/node-server": "^1.12.0",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "@sentry/node": "^8",
-    "@sorb/core": "^0.1.0",
+    "@sorb/core": "^0.2.0",
     "chokidar": "^3.6.0",
     "commander": "^12.0.0",
     "hono": "^4.4.0",
