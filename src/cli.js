@@ -46,6 +46,9 @@ import { probeUrl } from './probe'
 // Side-effect import: registers the default `local` CODE-SOURCE connector.
 // See spec/sorb/connectors-architecture.md §3.2 / §4 C2.
 import './codeSources/local'
+// Side-effect import: registers the `github` CODE-SOURCE connector (Option B
+// — point-at-existing-deployment). See spec/sorb/github-code-source-connector.md.
+import './codeSources/github'
 
 // ─── sorb.config.json loader ────────────────────────────────────────────────
 // The on-disk project config (namespace, token sources, port). Kept separate
