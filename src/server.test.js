@@ -659,12 +659,12 @@ describe('hosted mode — auth', () => {
 })
 
 describe('hosted mode — scope (publishable = read-only)', () => {
-  it('403 when a PUBLISHABLE key attempts a write (POST /preview)', async () => {
+  it('publishable key MAY POST /preview (ephemeral, non-destructive surface)', async () => {
     const { app } = await makeHostedApp()
     const res = await app.request('/preview', jsonAuth({ '--btn-bg': '#abc' }, PUBLISHABLE_KEY))
-    assert.equal(res.status, 403)
+    assert.equal(res.status, 200)
     const body = await res.json()
-    assert.equal(body.code, 'read_only')
+    assert.ok(body.id, 'preview created with an id')
   })
 
   it('403 when a PUBLISHABLE key attempts POST /verify', async () => {
@@ -944,7 +944,7 @@ describe('hosted mode — cross-tenant isolation', () => {
     assert.equal(del.status, 404)
   })
 
-  it('scope vs tenancy compose: publishable-A on B\'s preview → 404 (tenant gate); publishable-A on A\'s own → 403 read_only (scope gate)', async () => {
+  it('scope vs tenancy compose: publishable-A on B\'s preview → 404 (tenant gate); publishable-A on A\'s own → 200 (preview is ephemeral, not a commit)', async () => {
     const { app } = await makeHostedApp()
     const id = await seedAsA(app)
 
@@ -953,10 +953,12 @@ describe('hosted mode — cross-tenant isolation', () => {
     const crossTenantRead = await app.request(`/preview/${id}`, { headers: bearer(PUBLISHABLE_KEY_B) })
     assert.equal(crossTenantRead.status, 404)
 
-    // A publishable key for project A WRITING A's own preview: scope gate ⇒ 403.
+    // A publishable key for project A WRITING A's OWN preview: allowed — the
+    // preview surface is ephemeral/non-destructive (only /tokens commits are
+    // secret-gated). Tenancy still applies (its own preview, not a cross-tenant one).
     const ownWrite = await app.request(`/preview/${id}`, putAuth({ '--btn-bg': '#111111' }, PUBLISHABLE_KEY))
-    assert.equal(ownWrite.status, 403)
-    assert.equal((await ownWrite.json()).code, 'read_only')
+    assert.equal(ownWrite.status, 200)
+    assert.equal((await ownWrite.json()).updated, true)
   })
 
   it('revoked / unknown key → 401 and never reaches the tenant ownership query', async () => {

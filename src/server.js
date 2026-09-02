@@ -513,6 +513,18 @@ export const createServer = ({
     return null
   }
 
+  // Preview surface is EPHEMERAL and non-destructive: creating/updating/clearing
+  // a preview never mutates the committed token set (that is `POST /tokens/figma`,
+  // which stays `requireWrite`/secret-gated). The account-pairing front door mints
+  // a READ-ONLY publishable key, so the Figma plugin (and any cloud-side push)
+  // holds a `pk_`; requiring a secret key here made the whole preview payoff 403.
+  // We therefore accept ANY authenticated key for the preview routes — auth
+  // middleware still guarantees a valid, project-scoped key in hosted mode, and
+  // previews remain TTL-bounded, count-capped, and only render on apps that opt
+  // into preview mode with an allowlisted bridge origin. In local mode there is
+  // no auth context, so this is a no-op (parity with requireWrite).
+  const requirePreviewWrite = (_c) => null
+
   // Count the authed project's currently-active previews from the DB previews
   // table (project-scoped + TTL-aware). Owned by juice (001_core.sql).
   const activePreviewCount = async (projectId) => {
@@ -551,7 +563,7 @@ export const createServer = ({
   // shape is entirely a leaf/cloud-side concern.
   app.post('/preview', async (c) => {
     if (hosted) {
-      const denied = requireWrite(c)
+      const denied = requirePreviewWrite(c)
       if (denied) return denied
 
       const ctx = c.get('auth')
@@ -779,7 +791,7 @@ export const createServer = ({
   app.put('/preview/:id', async (c) => {
     const id = c.req.param('id')
     if (hosted) {
-      const denied = requireWrite(c)
+      const denied = requirePreviewWrite(c)
       if (denied) return denied
       // Tenant scope: a cross-tenant id is "not found".
       const ctx = c.get('auth')
@@ -811,7 +823,7 @@ export const createServer = ({
   app.delete('/preview/:id', async (c) => {
     const id = c.req.param('id')
     if (hosted) {
-      const denied = requireWrite(c)
+      const denied = requirePreviewWrite(c)
       if (denied) return denied
       // Tenant scope: only delete (and report deleted) when it belongs to the
       // tenant. A cross-tenant id is treated as already-absent.
