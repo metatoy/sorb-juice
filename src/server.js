@@ -52,7 +52,12 @@ const NOOP_LOCAL_RESULT_SYNC = () => {}
  * shared Postgres for auth + entitlements:
  *   - scoped CORS sourced from the project's `allowed_origins`,
  *   - a Bearer API key is required on every route except `/health` + `/ready`,
- *   - publishable keys are read-only (GET /preview/:id only; writes → 403),
+ *   - publishable keys are read-only ONLY for POST /verify and POST
+ *     /tokens/figma (403 `read_only`, via requireWrite) — every other route,
+ *     including the /preview writes, accepts any authenticated key, since
+ *     the account-pairing front door mints a read-only key for the Figma
+ *     plugin and previews are ephemeral/non-destructive (requirePreviewWrite
+ *     is a deliberate no-op; see its comment below),
  *   - entitlements are enforced (maxActivePreviews → 402, preview TTL,
  *     sharing-gated actions → 402), with past_due/canceled orgs degraded to Free.
  *
